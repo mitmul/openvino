@@ -14,6 +14,34 @@
 #include "openvino/core/parallel.hpp"
 #include "util.hpp"
 
+namespace {
+bool is_bool_u8_bridge(const ov::element::Type& src_type, const ov::element::Type& dst_type) {
+    return (src_type == ov::element::u8 && dst_type == ov::element::boolean) ||
+           (src_type == ov::element::boolean && dst_type == ov::element::u8);
+}
+
+ov::SoPtr<ov::ITensor> bridge_bool_u8_tensor(const ov::Output<const ov::Node>& port,
+                                             const ov::SoPtr<ov::ITensor>& tensor) {
+    const auto src_type = tensor->get_element_type();
+    const auto dst_type = port.get_element_type();
+    if (!is_bool_u8_bridge(src_type, dst_type)) {
+        return tensor;
+    }
+
+    OPENVINO_ASSERT(tensor->is_continuous(),
+                    "Expected a continuous tensor when bridging boolean/u8 port ",
+                    port.get_any_name());
+    LOG_DEBUG("Bridge boolean/u8 tensor for " << port.get_any_name() << ": " << src_type << " -> " << dst_type);
+    return ov::get_tensor_impl(ov::Tensor(dst_type, tensor->get_shape(), tensor->data(), tensor->get_strides()));
+}
+
+void set_tensor_compatible(const ov::SoPtr<ov::IAsyncInferRequest>& request,
+                           const ov::Output<const ov::Node>& port,
+                           const ov::SoPtr<ov::ITensor>& tensor) {
+    request->set_tensor(port, bridge_bool_u8_tensor(port, tensor));
+}
+}  // namespace
+
 ov::npuw::IBaseInferRequest::IBaseInferRequest(const std::shared_ptr<ov::npuw::CompiledModel>& compiled_model)
     : ov::ISyncInferRequest(compiled_model),
       m_npuw_model(compiled_model),
@@ -454,7 +482,7 @@ void ov::npuw::IBaseInferRequest::unpack_closure(std::size_t idx, RqPtr request)
                 closure_copy_required.push_back(cidx);
             } else {
                 // Easy case, just set one to another
-                request->set_tensor(iport, ov::get_tensor_impl(closure));
+                set_tensor_compatible(request, iport, ov::get_tensor_impl(closure));
             }
         }
     }  // for(closure)
@@ -608,7 +636,7 @@ void ov::npuw::IBaseInferRequest::bind_global_params(std::size_t idx, RqPtr requ
                 copy_list.emplace_back(g_tnsr, s_port);
             } else {
                 LOG_DEBUG("Will be set");
-                request->set_tensor(s_port, g_tnsr);
+                set_tensor_compatible(request, s_port, g_tnsr);
             }
         }
     }  // for(global_params)
@@ -759,7 +787,7 @@ void ov::npuw::IBaseInferRequest::bind_attention_inputs(std::size_t idx, RqPtr r
         for (auto&& param : dynamic.params) {
             const auto& iport = comp_model_desc.compiled_model->inputs()[param.idx];
             const auto& input = m_attention_io[idx].inputs.at(param.idx);
-            r->set_tensor(iport, input);
+            set_tensor_compatible(r, iport, input);
         }
     } else {
         const auto past_len = m_attention_selector->past_length();
@@ -791,7 +819,7 @@ void ov::npuw::IBaseInferRequest::bind_attention_inputs(std::size_t idx, RqPtr r
                 // (a view tensor can't be extended)
                 r->get_tensor(iport)->set_shape(shape);
             } else {
-                r->set_tensor(iport, view);
+                set_tensor_compatible(r, iport, view);
             }
         }  // for(params)
     }
@@ -820,7 +848,7 @@ void ov::npuw::IBaseInferRequest::bind_pyramid_attention_inputs(std::size_t idx,
         for (auto&& param : attention_info.params) {
             const auto& iport = pyramid_model->inputs()[param.idx];
             const auto& input = m_attention_io[idx].inputs.at(param.idx);
-            request->set_tensor(iport, input);
+            set_tensor_compatible(request, iport, input);
         }
 
         return;
@@ -845,7 +873,7 @@ void ov::npuw::IBaseInferRequest::bind_pyramid_attention_inputs(std::size_t idx,
 
             // Optimization for the last chunk: Direct tensor reuse when shapes match
             if (static_cast<int64_t>(input_shape[param.dim]) == past_len) {
-                request->set_tensor(iport, input);
+                set_tensor_compatible(request, iport, input);
                 continue;
             }
 
@@ -887,7 +915,7 @@ void ov::npuw::IBaseInferRequest::bind_pyramid_attention_inputs(std::size_t idx,
 
             // Optimization: Direct tensor reuse when destination matches input
             if (dst_shape == input_shape) {
-                request->set_tensor(iport, input);
+                set_tensor_compatible(request, iport, input);
                 continue;
             }
 

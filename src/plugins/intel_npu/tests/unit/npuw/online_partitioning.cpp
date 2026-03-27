@@ -4,6 +4,9 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 
 #include "intel_npu/config/config.hpp"
@@ -13,6 +16,7 @@
 #include "openvino/op/util/op_types.hpp"
 #include "openvino/openvino.hpp"
 #include "openvino/pass/stateful_to_stateless.hpp"
+#include "partitioning/partitioning.hpp"
 #include "partitioning/online/compiler.hpp"
 #include "partitioning/online/group.hpp"
 #include "partitioning/online/snapshot.hpp"
@@ -29,6 +33,88 @@ namespace {
     std::map<std::string, std::string> cfg_map = {{"NPUW_ONLINE_KEEP_BLOCK_SIZE", std::to_string(size)}};
     cfg.update(cfg_map);
     return cfg;
+}
+
+::intel_npu::Config createConfigWithPlan(const std::string& plan_path) {
+    auto opt_desc = std::make_shared<::intel_npu::OptionsDesc>();
+    auto cfg = ::intel_npu::Config(opt_desc);
+    ::intel_npu::registerNPUWOptions(*opt_desc);
+    std::map<std::string, std::string> cfg_map = {{"NPUW_PLAN", plan_path}};
+    cfg.update(cfg_map);
+    return cfg;
+}
+
+std::shared_ptr<ov::Model> build_stateful_assign_model() {
+    auto input = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{1, 4});
+    input->set_friendly_name("input");
+    input->get_output_tensor(0).set_names({"input"});
+
+    auto init = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{1, 4}, {0.f, 0.f, 0.f, 0.f});
+    auto variable = std::make_shared<ov::op::util::Variable>(
+        ov::op::util::VariableInfo{ov::PartialShape{1, 4}, ov::element::f32, "test_state"});
+
+    auto read = std::make_shared<ov::op::v6::ReadValue>(init, variable);
+    read->set_friendly_name("read_state");
+    read->get_output_tensor(0).set_names({"read_state"});
+
+    auto add = std::make_shared<ov::op::v1::Add>(input, read);
+    add->set_friendly_name("add_state");
+    add->get_output_tensor(0).set_names({"add_state"});
+
+    auto relu = std::make_shared<ov::op::v0::Relu>(add);
+    relu->set_friendly_name("relu_state");
+    relu->get_output_tensor(0).set_names({"relu_state"});
+
+    auto assign = std::make_shared<ov::op::v6::Assign>(relu, variable);
+    assign->set_friendly_name("assign_state");
+
+    auto result = std::make_shared<ov::op::v0::Result>(relu);
+    result->set_friendly_name("result_state");
+
+    return std::make_shared<ov::Model>(
+        ov::ResultVector{result},
+        ov::SinkVector{assign},
+        ov::ParameterVector{input},
+        "stateful_assign_model");
+}
+
+std::shared_ptr<ov::Model> build_stateful_beam_gather_model() {
+    auto input = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{1, 4});
+    input->set_friendly_name("input");
+    input->get_output_tensor(0).set_names({"input"});
+
+    auto beam_idx = std::make_shared<ov::op::v0::Parameter>(ov::element::i32, ov::Shape{1});
+    beam_idx->set_friendly_name("beam_idx");
+    beam_idx->get_output_tensor(0).set_names({"beam_idx"});
+
+    auto init = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{1, 4}, {0.f, 0.f, 0.f, 0.f});
+    auto variable = std::make_shared<ov::op::util::Variable>(
+        ov::op::util::VariableInfo{ov::PartialShape{1, 4}, ov::element::f32, "test_state_gather"});
+
+    auto read = std::make_shared<ov::op::v6::ReadValue>(init, variable);
+    read->set_friendly_name("read_state");
+    read->get_output_tensor(0).set_names({"read_state"});
+
+    auto axis = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{}, {0});
+    auto gather = std::make_shared<ov::op::v8::Gather>(read, beam_idx, axis);
+    gather->set_friendly_name("gather_state");
+    gather->get_output_tensor(0).set_names({"gather_state"});
+
+    auto add = std::make_shared<ov::op::v1::Add>(input, gather);
+    add->set_friendly_name("add_state");
+    add->get_output_tensor(0).set_names({"add_state"});
+
+    auto assign = std::make_shared<ov::op::v6::Assign>(add, variable);
+    assign->set_friendly_name("assign_state");
+
+    auto result = std::make_shared<ov::op::v0::Result>(add);
+    result->set_friendly_name("result_state");
+
+    return std::make_shared<ov::Model>(
+        ov::ResultVector{result},
+        ov::SinkVector{assign},
+        ov::ParameterVector{input, beam_idx},
+        "stateful_beam_gather_model");
 }
 
 bool isEqualEns(ov::npuw::Ensemble& ens1, ov::npuw::Ensemble& ens2);
@@ -134,6 +220,101 @@ TEST(OnlinePartitioningTest, Partitioning_IsTheSame_RepeatedModel) {
         auto ens_again = ov::npuw::online::buildPartitioning(model, cfg);
         EXPECT_TRUE(isEqualEns(ens, ens_again));
     }
+}
+
+TEST(OnlinePartitioningTest, Partitioning_PreservesStatefulAssignSinksInSubgraphModels) {
+    auto model = build_stateful_assign_model();
+    auto cfg = createConfigWithKeepBlockSize(16);
+
+    auto ens = ov::npuw::online::buildPartitioning(model, cfg);
+    ASSERT_FALSE(ens.groups.empty());
+
+    auto partitioning = ov::npuw::getPartitioning(model, cfg);
+    ASSERT_EQ(partitioning.subgraphs.size(), 1u);
+
+    const auto& subgraph = partitioning.subgraphs.front();
+    ASSERT_EQ(subgraph._sinks.size(), 1u);
+
+    auto assign = ov::as_type_ptr<ov::op::util::AssignBase>(subgraph._sinks.front());
+    ASSERT_NE(assign, nullptr);
+    EXPECT_EQ(assign->get_variable_id(), "test_state");
+
+    auto submodel = std::make_shared<ov::Model>(subgraph._results, subgraph._sinks, subgraph._parameters, "subgraph");
+    EXPECT_EQ(submodel->get_sinks().size(), 1u);
+
+    size_t read_value_count = 0u;
+    size_t assign_count = 0u;
+    for (const auto& op : submodel->get_ordered_ops()) {
+        if (ov::as_type_ptr<ov::op::util::ReadValueBase>(op) != nullptr) {
+            read_value_count++;
+        }
+        if (ov::as_type_ptr<ov::op::util::AssignBase>(op) != nullptr) {
+            assign_count++;
+        }
+    }
+
+    EXPECT_EQ(read_value_count, 1u);
+    EXPECT_EQ(assign_count, 1u);
+}
+
+TEST(OnlinePartitioningTest, Partitioning_RestoresOmittedAssignSinkForPlannedStatefulBeamGatherGroup) {
+    auto model = build_stateful_beam_gather_model();
+
+    const auto unique_id = std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+    const auto plan_path =
+        std::filesystem::temp_directory_path() / ("npuw_stateful_beam_gather_plan_" + unique_id + ".xml");
+
+    {
+        std::ofstream plan(plan_path);
+        ASSERT_TRUE(plan.is_open());
+        plan << R"(<ensemble gflops="0">)"
+                R"(<partitioning>)"
+                R"(<group gflops="0">)"
+                R"(<input name="gather_state"/>)"
+                R"(<input name="add_state"/>)"
+                R"(<output name="add_state"/>)"
+                R"(<layer name="read_state"/>)"
+                R"(<layer name="gather_state"/>)"
+                R"(<layer name="add_state"/>)"
+                R"(</group>)"
+                R"(</partitioning>)"
+                R"(</ensemble>)";
+    }
+
+    auto cfg = createConfigWithPlan(plan_path.string());
+    auto partitioning = ov::npuw::getPartitioning(model, cfg);
+    std::filesystem::remove(plan_path);
+
+    ASSERT_EQ(partitioning.subgraphs.size(), 1u);
+
+    const auto& subgraph = partitioning.subgraphs.front();
+    ASSERT_EQ(subgraph._sinks.size(), 1u);
+
+    auto assign = ov::as_type_ptr<ov::op::util::AssignBase>(subgraph._sinks.front());
+    ASSERT_NE(assign, nullptr);
+    EXPECT_EQ(assign->get_variable_id(), "test_state_gather");
+
+    auto submodel = std::make_shared<ov::Model>(subgraph._results, subgraph._sinks, subgraph._parameters, "subgraph");
+    EXPECT_EQ(submodel->get_sinks().size(), 1u);
+
+    size_t read_value_count = 0u;
+    size_t assign_count = 0u;
+    size_t gather_count = 0u;
+    for (const auto& op : submodel->get_ordered_ops()) {
+        if (ov::as_type_ptr<ov::op::util::ReadValueBase>(op) != nullptr) {
+            read_value_count++;
+        }
+        if (ov::as_type_ptr<ov::op::util::AssignBase>(op) != nullptr) {
+            assign_count++;
+        }
+        if (ov::as_type_ptr<ov::op::v8::Gather>(op) != nullptr) {
+            gather_count++;
+        }
+    }
+
+    EXPECT_EQ(read_value_count, 1u);
+    EXPECT_EQ(assign_count, 1u);
+    EXPECT_EQ(gather_count, 1u);
 }
 
 TEST(OnlinePartitioningTest, Partitioning_SingleGroup_SmallModel) {

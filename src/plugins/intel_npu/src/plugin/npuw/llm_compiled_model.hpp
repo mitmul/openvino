@@ -102,6 +102,7 @@ private:
 
     // Support LoRA
     void convert_stateful_lora_to_stateless(std::shared_ptr<ov::Model>& model);
+    void gemma_transformations(const std::shared_ptr<ov::Model>& model);
     uint32_t m_max_lora_rank = 32;
 
     // Support prefix caching
@@ -114,6 +115,7 @@ private:
 
     bool m_is_whisper = false;
     uint64_t m_eos_token_id = 0;
+    uint32_t m_gemma_sliding_window_size = 0;
 
     bool m_is_embedding = false;
 

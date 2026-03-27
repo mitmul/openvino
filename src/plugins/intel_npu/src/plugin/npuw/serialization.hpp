@@ -17,6 +17,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "openvino/core/any.hpp"
 #include "openvino/runtime/file_handle.hpp"
 
 namespace ov {
@@ -155,20 +156,20 @@ struct WeightsContext {
     ov::FileHandleProvider handle_provider = nullptr;
 };
 
-// Context for deserializing submodels with dynamic attention mechanisms
-// (Pyramid Attention, Host Flash Attention, etc.)
-// Provides plugin, device, and compiled model reference for proper deserialization
 struct SubmodelDeserializeCtx {
     SubmodelDeserializeCtx(const std::shared_ptr<const ov::IPlugin>& _plugin,
                            const std::string& _device,
-                           const ov::SoPtr<ov::ICompiledModel>& _compiled_model)
+                           const ov::SoPtr<ov::ICompiledModel>& _compiled_model,
+                           const ov::AnyMap& _import_config = {})
         : plugin(_plugin),
           device(_device),
-          compiled_model(_compiled_model) {}
+          compiled_model(_compiled_model),
+          import_config(_import_config) {}
 
     std::shared_ptr<const ov::IPlugin> plugin;
     std::string device;
     const ov::SoPtr<ov::ICompiledModel>& compiled_model;
+    ov::AnyMap import_config;
 };
 
 BF16Cache get_bf16_consts(const std::shared_ptr<ov::Model>& model);

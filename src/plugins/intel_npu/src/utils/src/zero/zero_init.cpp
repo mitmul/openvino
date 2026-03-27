@@ -8,6 +8,7 @@
 #include <ze_context_npu_ext.h>
 #include <ze_driver_npu_ext.h>
 #include <ze_graph_ext.h>
+#include <ze_mem_import_system_memory_ext.h>
 
 #include <regex>
 

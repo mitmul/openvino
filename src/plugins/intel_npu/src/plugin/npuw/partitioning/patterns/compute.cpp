@@ -1,4 +1,4 @@
-// Copyright (C) 2018-2026 Intel Corporation
+// Copyright (C) 2024 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 //
 
@@ -63,10 +63,18 @@ DQMatMulGQu4::DQMatMulGQu4(const std::shared_ptr<ov::npuw::online::Snapshot>& sn
             auto matched_qreshp = node_to_output.at(qreshp).get_node_shared_ptr();
             auto matched_qmm = node_to_output.at(qmm).get_node_shared_ptr();
 
-            node_to_gptr->at(matched_qsubz)->isolate(isol_tag);
-            node_to_gptr->at(matched_qmuls)->isolate(isol_tag);
-            node_to_gptr->at(matched_qreshp)->isolate(isol_tag);
-            node_to_gptr->at(matched_qmm)->isolate(isol_tag);
+            const auto isolate_if_present = [&](const std::shared_ptr<ov::Node>& node) {
+                const auto group_iter = node_to_gptr->find(node);
+                if (group_iter == node_to_gptr->end()) {
+                    return false;
+                }
+                group_iter->second->isolate(isol_tag);
+                return true;
+            };
+            if (!isolate_if_present(matched_qsubz) || !isolate_if_present(matched_qmuls) ||
+                !isolate_if_present(matched_qreshp) || !isolate_if_present(matched_qmm)) {
+                return false;
+            }
         }
 
         return false;  // root hasn't changed
@@ -118,10 +126,18 @@ DQMatMulCWu4::DQMatMulCWu4(const std::shared_ptr<ov::npuw::online::Snapshot>& sn
             auto matched_qcvtm = node_to_output.at(qcvtm).get_node_shared_ptr();
             auto matched_qmm = node_to_output.at(qmm).get_node_shared_ptr();
 
-            node_to_gptr->at(matched_qsubz)->isolate(isol_tag);
-            node_to_gptr->at(matched_qmuls)->isolate(isol_tag);
-            node_to_gptr->at(matched_qcvtm)->isolate(isol_tag);
-            node_to_gptr->at(matched_qmm)->isolate(isol_tag);
+            const auto isolate_if_present = [&](const std::shared_ptr<ov::Node>& node) {
+                const auto group_iter = node_to_gptr->find(node);
+                if (group_iter == node_to_gptr->end()) {
+                    return false;
+                }
+                group_iter->second->isolate(isol_tag);
+                return true;
+            };
+            if (!isolate_if_present(matched_qsubz) || !isolate_if_present(matched_qmuls) ||
+                !isolate_if_present(matched_qcvtm) || !isolate_if_present(matched_qmm)) {
+                return false;
+            }
         }
 
         return false;  // root hasn't changed
@@ -172,31 +188,48 @@ DQMatMulGQi4::DQMatMulGQi4(const std::shared_ptr<ov::npuw::online::Snapshot>& sn
             auto matched_qreshp = node_to_output.at(qreshp).get_node_shared_ptr();
             auto matched_qmm = node_to_output.at(qmm).get_node_shared_ptr();
 
-            node_to_gptr->at(matched_qmuls)->isolate(isol_tag);
-            node_to_gptr->at(matched_qreshp)->isolate(isol_tag);
-            node_to_gptr->at(matched_qmm)->isolate(isol_tag);
+            const auto isolate_if_present = [&](const std::shared_ptr<ov::Node>& node) {
+                const auto group_iter = node_to_gptr->find(node);
+                if (group_iter == node_to_gptr->end()) {
+                    return false;
+                }
+                group_iter->second->isolate(isol_tag);
+                return true;
+            };
+            if (!isolate_if_present(matched_qmuls) || !isolate_if_present(matched_qreshp) ||
+                !isolate_if_present(matched_qmm)) {
+                return false;
+            }
 
             auto qcvtr_iter = node_to_output.find(qcvtr);
             if (qcvtr_iter != node_to_output.end()) {
                 auto matched_qcvtr = qcvtr_iter->second.get_node_shared_ptr();
-                node_to_gptr->at(matched_qcvtr)->isolate(isol_tag);
+                if (!isolate_if_present(matched_qcvtr)) {
+                    return false;
+                }
             }
 
             auto fake_convert_iter = node_to_output.find(fake_convert);
             if (fake_convert_iter != node_to_output.end()) {
                 auto matched_fake_convert = fake_convert_iter->second.get_node_shared_ptr();
-                node_to_gptr->at(matched_fake_convert)->isolate(isol_tag);
+                if (!isolate_if_present(matched_fake_convert)) {
+                    return false;
+                }
 
                 auto transpose_iter = node_to_output.find(transpose);
                 if (transpose_iter != node_to_output.end()) {
                     auto matched_transpose = transpose_iter->second.get_node_shared_ptr();
-                    node_to_gptr->at(matched_transpose)->isolate(isol_tag);
+                    if (!isolate_if_present(matched_transpose)) {
+                        return false;
+                    }
                 }
 
                 auto reshape_iter = node_to_output.find(reshape);
                 if (reshape_iter != node_to_output.end()) {
                     auto matched_reshape = reshape_iter->second.get_node_shared_ptr();
-                    node_to_gptr->at(matched_reshape)->isolate(isol_tag);
+                    if (!isolate_if_present(matched_reshape)) {
+                        return false;
+                    }
                 }
             }
         }
@@ -248,30 +281,47 @@ DQMatMulCWi4::DQMatMulCWi4(const std::shared_ptr<ov::npuw::online::Snapshot>& sn
             auto matched_qmuls = node_to_output.at(qmuls).get_node_shared_ptr();
             auto matched_qmm = node_to_output.at(qmm).get_node_shared_ptr();
 
-            node_to_gptr->at(matched_qmuls)->isolate(isol_tag);
-            node_to_gptr->at(matched_qmm)->isolate(isol_tag);
+            const auto isolate_if_present = [&](const std::shared_ptr<ov::Node>& node) {
+                const auto group_iter = node_to_gptr->find(node);
+                if (group_iter == node_to_gptr->end()) {
+                    return false;
+                }
+                group_iter->second->isolate(isol_tag);
+                return true;
+            };
+            if (!isolate_if_present(matched_qmuls) || !isolate_if_present(matched_qmm)) {
+                return false;
+            }
 
             auto qcvtm_iter = node_to_output.find(qcvtm);
             if (qcvtm_iter != node_to_output.end()) {
                 auto matched_qcvtm = qcvtm_iter->second.get_node_shared_ptr();
-                node_to_gptr->at(matched_qcvtm)->isolate(isol_tag);
+                if (!isolate_if_present(matched_qcvtm)) {
+                    return false;
+                }
             }
 
             auto fake_convert_iter = node_to_output.find(fake_convert);
             if (fake_convert_iter != node_to_output.end()) {
                 auto matched_fake_convert = fake_convert_iter->second.get_node_shared_ptr();
-                node_to_gptr->at(matched_fake_convert)->isolate(isol_tag);
+                if (!isolate_if_present(matched_fake_convert)) {
+                    return false;
+                }
 
                 auto transpose_iter = node_to_output.find(transpose);
                 if (transpose_iter != node_to_output.end()) {
                     auto matched_transpose = transpose_iter->second.get_node_shared_ptr();
-                    node_to_gptr->at(matched_transpose)->isolate(isol_tag);
+                    if (!isolate_if_present(matched_transpose)) {
+                        return false;
+                    }
                 }
 
                 auto reshape_iter = node_to_output.find(reshape);
                 if (reshape_iter != node_to_output.end()) {
                     auto matched_reshape = reshape_iter->second.get_node_shared_ptr();
-                    node_to_gptr->at(matched_reshape)->isolate(isol_tag);
+                    if (!isolate_if_present(matched_reshape)) {
+                        return false;
+                    }
                 }
             }
         }
@@ -516,11 +566,19 @@ RMSNorm4::RMSNorm4(const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot, 
         auto matched_sqrt = node_to_output.at(sqrt).get_node_shared_ptr();
         auto matched_div = node_to_output.at(div).get_node_shared_ptr();
 
-        node_to_gptr->at(matched_power)->isolate(isol_tag);
-        node_to_gptr->at(matched_reduce)->isolate(isol_tag);
-        node_to_gptr->at(matched_cadd)->isolate(isol_tag);
-        node_to_gptr->at(matched_sqrt)->isolate(isol_tag);
-        node_to_gptr->at(matched_div)->isolate(isol_tag);
+        const auto isolate_if_present = [&](const std::shared_ptr<ov::Node>& node) {
+            const auto group_iter = node_to_gptr->find(node);
+            if (group_iter == node_to_gptr->end()) {
+                return false;
+            }
+            group_iter->second->isolate(isol_tag);
+            return true;
+        };
+        if (!isolate_if_present(matched_power) || !isolate_if_present(matched_reduce) ||
+            !isolate_if_present(matched_cadd) || !isolate_if_present(matched_sqrt) ||
+            !isolate_if_present(matched_div)) {
+            return false;
+        }
 
         return false;  // root hasn't changed
     };

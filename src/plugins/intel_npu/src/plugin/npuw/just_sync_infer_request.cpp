@@ -19,6 +19,34 @@
 #include "pyramid_attention.hpp"
 #include "weights_bank.hpp"
 
+namespace {
+bool is_bool_u8_bridge(const ov::element::Type& src_type, const ov::element::Type& dst_type) {
+    return (src_type == ov::element::u8 && dst_type == ov::element::boolean) ||
+           (src_type == ov::element::boolean && dst_type == ov::element::u8);
+}
+
+ov::SoPtr<ov::ITensor> bridge_bool_u8_tensor(const ov::Output<const ov::Node>& port,
+                                             const ov::SoPtr<ov::ITensor>& tensor) {
+    const auto src_type = tensor->get_element_type();
+    const auto dst_type = port.get_element_type();
+    if (!is_bool_u8_bridge(src_type, dst_type)) {
+        return tensor;
+    }
+
+    OPENVINO_ASSERT(tensor->is_continuous(),
+                    "Expected a continuous tensor when bridging boolean/u8 port ",
+                    port.get_any_name());
+    LOG_DEBUG("Bridge boolean/u8 tensor for " << port.get_any_name() << ": " << src_type << " -> " << dst_type);
+    return ov::get_tensor_impl(ov::Tensor(dst_type, tensor->get_shape(), tensor->data(), tensor->get_strides()));
+}
+
+void set_tensor_compatible(const ov::SoPtr<ov::IAsyncInferRequest>& request,
+                           const ov::Output<const ov::Node>& port,
+                           const ov::SoPtr<ov::ITensor>& tensor) {
+    request->set_tensor(port, bridge_bool_u8_tensor(port, tensor));
+}
+}  // namespace
+
 // ====================================================================================================
 // ISubrequestAccessor Interface Implementation
 // ====================================================================================================
@@ -573,7 +601,7 @@ void ov::npuw::JustInferRequest::connect_subrequests() {
             // - Take a tensor from the storage & assign it to the reader
             const auto& iport = m_subrequests[subm_idx_to]->get_compiled_model()->inputs()[port_idx_to];
             const auto& tensor = m_funcall_result.at(LinkFrom{subm_idx_from, port_idx_from});
-            subreqs[subm_idx_to]->set_tensor(iport, tensor);
+            set_tensor_compatible(subreqs[subm_idx_to], iport, tensor);
             LOG_DEBUG("Set Subgraph[" << subm_idx_to << "]/" << iport << " to internal tensor");
         } else if (!subm[subm_idx_from].replaced_by && subm[subm_idx_to].replaced_by) {
             LOG_DEBUG("Skip: reader is a function call");
@@ -607,7 +635,7 @@ void ov::npuw::JustInferRequest::connect_subrequests() {
             const auto& tensor = subreqs[subm_idx_from]->get_tensor(oport);
             LOG_DEBUG("Set Subgraph[" << subm_idx_to << "]/" << iport << " to Subgraph[" << subm_idx_from << "]/"
                                       << oport);
-            subreqs[subm_idx_to]->set_tensor(iport, tensor);
+            set_tensor_compatible(subreqs[subm_idx_to], iport, tensor);
         }
     }  // for(map)
     LOG_INFO("Done");
@@ -774,7 +802,7 @@ void ov::npuw::JustInferRequest::function_prologue(std::size_t idx) {
             } else if (is_dynamic) {
                 // Set tensor only if it is non-dynamic (dynamic are managed by the infer_dynamic)
                 if (is_non_param_mask(*func_desc.attention, i)) {
-                    m_subrequests[real_idx]->set_tensor(iport, i_tensor);
+                    set_tensor_compatible(m_subrequests[real_idx], iport, i_tensor);
                 } else {
                     m_attention_io[idx].inputs.at(i) = i_tensor;
                 }
@@ -783,7 +811,7 @@ void ov::npuw::JustInferRequest::function_prologue(std::size_t idx) {
                 auto pyramid_id = m_pyramid_selector->pyramid_id();
                 const auto& info = func_desc.pyramid_attention.value()._attention_infos[pyramid_id];
                 if (is_non_param_mask(info, i)) {
-                    m_subrequests[real_idx]->set_tensor(iport, i_tensor);
+                    set_tensor_compatible(m_subrequests[real_idx], iport, i_tensor);
                 } else {
                     m_attention_io[idx].inputs.at(i) = i_tensor;
                 }
@@ -797,7 +825,7 @@ void ov::npuw::JustInferRequest::function_prologue(std::size_t idx) {
                 }
             } else {
                 // Default case
-                m_subrequests[real_idx]->set_tensor(iport, i_tensor);
+                set_tensor_compatible(m_subrequests[real_idx], iport, i_tensor);
             }
         }  // if (link_iter)
     }  // for(param_base)
@@ -866,7 +894,7 @@ void ov::npuw::JustInferRequest::function_prologue_attn(std::size_t real_idx, st
     if (pos_id == -1) {
         // Dynamic range couldn't be identified - fallback to the default
         // (worst case) behavior
-        r->set_tensor(mask_iport, graph_mask);
+        set_tensor_compatible(r, mask_iport, graph_mask);
     } else {
         const auto past_len = m_attention_selector->past_length();
         const auto present_len = dynamic.query_size;
@@ -875,7 +903,7 @@ void ov::npuw::JustInferRequest::function_prologue_attn(std::size_t real_idx, st
 
         auto set_or_copy = [&](const auto& view) {
             if (!needs_copy(idx)) {
-                r->set_tensor(mask_iport, view);
+                set_tensor_compatible(r, mask_iport, view);
             } else {
                 const auto& dst = r->get_tensor(mask_iport);
                 dst->set_shape(view->get_shape());
@@ -894,7 +922,7 @@ void ov::npuw::JustInferRequest::function_prologue_attn(std::size_t real_idx, st
             if (m_cached_attention_mask) {
                 // All sub models are sharing the same attention mask, we can use the cached attention
                 // mask directly to avoid redundant tensor copy
-                m_subrequests[real_idx]->set_tensor(mask_iport, m_cached_attention_mask);
+                set_tensor_compatible(m_subrequests[real_idx], mask_iport, m_cached_attention_mask);
                 return;
             }
 
@@ -963,7 +991,7 @@ void ov::npuw::JustInferRequest::function_prologue_pyramid_attn(std::size_t real
     auto pos_id = m_pyramid_selector->length();
     if (pos_id == -1) {
         // Pyramid dynamic range couldn't be identified - fallback to default behavior
-        r->set_tensor(mask_iport, graph_mask);
+        set_tensor_compatible(r, mask_iport, graph_mask);
         return;
     }
 
@@ -974,7 +1002,7 @@ void ov::npuw::JustInferRequest::function_prologue_pyramid_attn(std::size_t real
     if (m_cached_attention_mask) {
         // All sub models are sharing the same attention mask, we can use the cached attention
         // mask directly to avoid redundant tensor copy
-        m_subrequests[real_idx]->set_tensor(mask_iport, m_cached_attention_mask);
+        set_tensor_compatible(m_subrequests[real_idx], mask_iport, m_cached_attention_mask);
         return;
     }
 
@@ -987,7 +1015,7 @@ void ov::npuw::JustInferRequest::function_prologue_pyramid_attn(std::size_t real
 
         // Optimization: if shapes match, use the full mask directly
         if (dst_shape == full_mask_shape) {
-            r->set_tensor(mask_iport, graph_mask);
+            set_tensor_compatible(r, mask_iport, graph_mask);
             m_cached_attention_mask = graph_mask;
             return;
         }

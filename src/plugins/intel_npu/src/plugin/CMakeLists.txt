@@ -45,6 +45,8 @@ target_include_directories(${TARGET_NAME}
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     PRIVATE
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/>
+    PRIVATE
+        $<BUILD_INTERFACE:${OpenVINO_SOURCE_DIR}/src/plugins/intel_npu/src/ops/include>
 )
 
 cross_compiled_file(${TARGET_NAME}

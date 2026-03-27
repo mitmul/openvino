@@ -1,4 +1,4 @@
-// Copyright (C) 2018-2026 Intel Corporation
+// Copyright (C) 2023-2024 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 //
 
@@ -15,7 +15,9 @@
 #include "openvino/core/rt_info/weightless_caching_attributes.hpp"
 #include "openvino/op/convert.hpp"
 #include "openvino/op/slice.hpp"
+#include "openvino/op/util/assign_base.hpp"
 #include "openvino/op/util/op_types.hpp"
+#include "openvino/op/util/read_value_base.hpp"
 #include "openvino/pass/validate.hpp"
 #include "openvino/runtime/make_tensor.hpp"
 #include "openvino/util/common_util.hpp"
@@ -151,7 +153,7 @@ ov::npuw::Ensemble load_groups(const std::shared_ptr<ov::Model>& model, const st
         this_group.gflops = get_float_attr(group, "gflops");
         this_group.repeated_id = get_str_attr(group, "repeated", "");
         this_group.avoid_list = get_str_attr(group, "avoid", "");
-        this_group.settag(get_str_attr(group, "tag", ""));
+        this_group.tag = get_str_attr(group, "tag", "");
         FOREACH_CHILD(input, group, "input") {
             this_group.input_layers.push_back(get_str_attr(input, "name"));
         }
@@ -183,10 +185,7 @@ ov::npuw::Ensemble load_groups(const std::shared_ptr<ov::Model>& model, const st
 
     LOG_INFO("Found " << repeated.size() << " different repeated block(s)");
 
-    return ov::npuw::Ensemble{get_float_attr(root, "gflops"),
-                              get_bool_attr(root, "irregular_io", false),
-                              std::move(partitions),
-                              std::move(repeated)};
+    return ov::npuw::Ensemble{get_float_attr(root, "gflops"), std::move(partitions), std::move(repeated)};
 }
 
 class Partitioner {
@@ -238,11 +237,6 @@ private:
 
     using Match = std::function<bool(const std::shared_ptr<ov::Node>& node)>;
     void propagate(const std::string& func_name, const Match& test, ov::npuw::RepeatedBlock::MatchedBank& bank);
-
-    // Helper method to find and cache router model for MoE transformations
-    // Returns cached router model if available, otherwise searches P.functions
-    // for a function tagged as "router" and caches it for future use
-    std::shared_ptr<ov::Model> getRouterModel();
 
     void createFunction(FunctionPipeline& func_ggg);
 
@@ -341,13 +335,6 @@ public:
     void matchRepeatedSubgraphs(const std::string& func_name);
     void spatial(const std::string& func_name);
     void attention(const std::string& func_name);
-
-    // MoE-specific transformations (require router model availability)
-    // transformMoeExperts: Transform expert functions (tag="expert") to optimized MoE expert models
-    // transformMoeDownstream: Transform downstream processing (pattern-based detection)
-    void transformMoeExperts(const std::string& func_name);
-    void transformMoeDownstream(const std::string& func_name);
-
     void optimize(const std::string& func_name);
     void decompressionCutOff(const std::string& func_name);
 
@@ -392,7 +379,7 @@ void Partitioner::identifySubgraphs() {
     LOG_INFO("Identifying subgraphs for model " << model->get_friendly_name() << "...");
     LOG_BLOCK();
 
-    const bool connect_in_f16 = cfg.get<::intel_npu::NPUW_F16IC>() && !ens.irregular_io;
+    const bool connect_in_f16 = cfg.get<::intel_npu::NPUW_F16IC>();
 
     using namespace ov::npuw;
     std::vector<ov::npuw::Group>& partitions = ens.groups;
@@ -406,10 +393,23 @@ void Partitioner::identifySubgraphs() {
         node_id_cache[node_ptr->get_friendly_name()] = node_ptr;
     }
     LOG_INFO("Caching done: " << node_id_cache.size() << " layers.");
+    const auto model_sinks = model->get_sinks();
+    std::unordered_map<std::string, ov::NodeVector> assign_sinks_by_variable_id;
+    for (const auto& sink : model_sinks) {
+        if (const auto assign = ov::as_type_ptr<ov::op::util::AssignBase>(sink)) {
+            assign_sinks_by_variable_id[assign->get_variable_id()].push_back(sink);
+        }
+    }
 
     // Accumulate knowledge about known OV layers when walking
     // over a topologically-sorted list.
     std::unordered_set<NodeSPtr> nodes_known_now;
+    std::unordered_set<std::string> planned_layer_names;
+    for (const auto& partition : partitions) {
+        planned_layer_names.insert(partition.all_layers.begin(), partition.all_layers.end());
+        planned_layer_names.insert(partition.input_layers.begin(), partition.input_layers.end());
+        planned_layer_names.insert(partition.output_layers.begin(), partition.output_layers.end());
+    }
 
     // FIXME: Need to do some sanity checks here. What if partitioning
     // has been generated for another variation of this model?
@@ -436,7 +436,38 @@ void Partitioner::identifySubgraphs() {
         P.total_ops += group.sg._ops;
 
         group.sg._avoid_list = group.avoid_list;
-        group.sg.settag(group.gettag());
+        group.sg._tag = group.tag;
+        std::unordered_set<std::string> group_read_variables;
+        for (const auto& node : group_nodes) {
+            if (const auto read_value = ov::as_type_ptr<ov::op::util::ReadValueBase>(node)) {
+                group_read_variables.insert(read_value->get_variable_id());
+            }
+        }
+
+        // Offline plans may omit Assign from all_layers/output_layers even when the
+        // matching ReadValue remains in the group. Pull sibling Assign sinks back in
+        // by variable_id so the rebuilt subgraph model stays stateful.
+        std::unordered_set<NodeSPtr> group_sinks;
+        group.sg._sinks.clear();
+        for (const auto& sink : model_sinks) {
+            if (group_nodes.count(sink) != 0) {
+                group_sinks.insert(sink);
+            }
+        }
+        for (const auto& variable_id : group_read_variables) {
+            auto assign_it = assign_sinks_by_variable_id.find(variable_id);
+            if (assign_it == assign_sinks_by_variable_id.end()) {
+                continue;
+            }
+            for (const auto& sink : assign_it->second) {
+                group_sinks.insert(sink);
+            }
+        }
+        for (const auto& sink : model_sinks) {
+            if (group_sinks.count(sink) != 0) {
+                group.sg._sinks.push_back(sink);
+            }
+        }
         // Note inputs and outputs are included in the above set, so if
         // we are here, those nodes should be present in the model.
 
@@ -677,10 +708,13 @@ void Partitioner::identifySubgraphs() {
                 for (auto&& oport : layer_ptr->outputs()) {
                     for (auto&& inport : oport.get_target_inputs()) {
                         auto reader_ptr = inport.get_node();
-                        if (ov::is_type<ov::op::v0::Convert>(reader_ptr) &&
-                            ProducesResult {}(reader_ptr->shared_from_this()) &&
-                            !output_layers_cache.count(reader_ptr->get_friendly_name())) {
-                            const auto& cvt_name = reader_ptr->get_friendly_name();
+                        const auto reader_sptr = reader_ptr->shared_from_this();
+                        const auto& cvt_name = reader_ptr->get_friendly_name();
+                        const bool reader_in_current_group = group_nodes.count(reader_sptr) != 0;
+                        const bool reader_belongs_to_other_partition =
+                            planned_layer_names.count(cvt_name) != 0 && !reader_in_current_group;
+                        if (ov::is_type<ov::op::v0::Convert>(reader_ptr) && ProducesResult {}(reader_sptr) &&
+                            !output_layers_cache.count(cvt_name) && !reader_belongs_to_other_partition) {
                             output_layers_cache.insert(cvt_name);
                             group.output_layers.push_back(cvt_name);
                         }
@@ -1404,19 +1438,12 @@ void Partitioner::saveRepeatedConstants(const std::string& func_name) {
             HANDLE_CASE(f8e4m3, uint8_t);
             HANDLE_CASE(f16, uint16_t);
             HANDLE_CASE(f32, float);
-            HANDLE_CASE(u8, uint8_t);
 #undef HANDLE_CASE
         default:
             OPENVINO_THROW("Unable to handle type ", node_a->output(0));
         }
         return false;
     };
-    // Helper to check if a constant is MoE Gather indices (marked by GatherTo2DGather pass)
-    auto is_moe_gather_const = [](const CTPtr& const_node) -> bool {
-        const auto& rt_info = const_node->get_rt_info();
-        return rt_info.count("npuw_moe_gather_indices") > 0;
-    };
-
     auto check_and_mark = [&](const ov::npuw::RepeatedBlock::MatchedLayers& bank) {
         std::unordered_set<CTPtr> instances;
         for (auto&& l : bank) {
@@ -1428,30 +1455,19 @@ void Partitioner::saveRepeatedConstants(const std::string& func_name) {
         LOG_DEBUG("Checking a bank with prototype node " << proto_node << "...");
         LOG_BLOCK();
 
-        bool is_tiny = ov::npuw::partitioning::traits::is_tiny_shape(proto_shape);
-        bool is_moe_gather = is_moe_gather_const(proto_node);
-        if (!is_tiny && !is_moe_gather) {
-            LOG_DEBUG("[CUT ] Not tiny shape and not MoE Gather indices - will be cut-off from the function");
-            return;
-        }
-
-        bool all_identical = std::all_of(instances.begin(), instances.end(), [&](const CTPtr& other_node) -> bool {
-            return (other_node->output(0).get_shape() == proto_node->output(0).get_shape()) &&
-                   values_are_the_same(proto_node, other_node);
-        });
-        if (!all_identical) {
-            LOG_DEBUG("[CUT ] Values differ across instances - will be cut-off from the function: "
-                      << proto_node->get_friendly_name());
-            return;
-        }
-
-        if (is_moe_gather) {
-            LOG_DEBUG("[KEEP] MoE Gather indices constant - identical across all repeats");
+        if (ov::npuw::partitioning::traits::is_tiny_shape(proto_shape) &&
+            std::all_of(instances.begin(), instances.end(), [&](const CTPtr& other_node) -> bool {
+                return (other_node->output(0).get_shape() == proto_node->output(0).get_shape()) &&
+                       values_are_the_same(proto_node, other_node);
+            })) {
+            // Check passed for this group.
+            LOG_DEBUG("[KEEP] It is safe to keep this bank in function");
+            for (auto&& const_node : instances) {
+                func_group.consts_to_keep.insert(const_node);
+            }
         } else {
-            LOG_DEBUG("[KEEP] Tiny shape constant - safe to keep in function");
-        }
-        for (auto&& const_node : instances) {
-            func_group.consts_to_keep.insert(const_node);
+            LOG_DEBUG("[CUT ] This group of Const ops will be cut-off from the function: "
+                      << proto_node->get_friendly_name());
         }
     };
     for (auto&& bank : rep_block.consts) {
@@ -1494,12 +1510,9 @@ void Partitioner::saveTailDictConstants(const std::string& func_name) {
     using CPtr = std::shared_ptr<ov::op::v0::Constant>;
     std::vector<CPtr> to_keep;
 
-    ov::npuw::patterns::opt::Context ctx;
-    ctx.mm_gate = cfg.get<::intel_npu::NPUW_MM_GATED>();
-
     ov::pass::GraphRewrite rewr;
-    rewr.add_matcher<ov::npuw::patterns::opt::PreserveConstDictMatMulAsymm>(std::ref(ctx), std::ref(to_keep));
-    rewr.add_matcher<ov::npuw::patterns::opt::PreserveConstDictMatMulFP8>(std::ref(ctx), std::ref(to_keep));
+    rewr.add_matcher<ov::npuw::patterns::opt::PreserveConstDictMatMulAsymm>(std::ref(to_keep));
+    rewr.add_matcher<ov::npuw::patterns::opt::PreserveConstDictMatMulSymm>(std::ref(to_keep));
     rewr.run_on_model(model_group.front());
 
     for (auto&& const_to_keep : to_keep) {
@@ -1657,7 +1670,7 @@ void Partitioner::createFunction(FunctionPipeline& func_ggg) {
     ov::npuw::Function function;
     function._model = func_ggg.mdls.front();
     function._param_offset = body_sg._parameters.size();
-    function.settag(body_sg.gettag());
+    function._tag = body_sg._tag;
     std::size_t new_param_idx = function._param_offset;
 
     for (auto&& node_ptr : function._model->get_ordered_ops()) {
@@ -1723,7 +1736,7 @@ void Partitioner::createFunction(FunctionPipeline& func_ggg) {
 }
 
 void Partitioner::identifySpatialRange(ov::npuw::Function& f) {
-    NPUW_ASSERT(f.gettag() == "compute");
+    NPUW_ASSERT(f._tag == "compute");
 
     // NB: The current logic must be changed. Here we assume we only
     // apply this change to "compute" subgraphs which we identify
@@ -1881,7 +1894,7 @@ void Partitioner::spatial(const std::string& func_name) {
     // Identify the spatial dimension for this function
     // Works only for Compute case.
     // FIXME: Replace this string identification with smt better
-    if (!cfg.get<::intel_npu::NPUW_SPATIAL>() || f.gettag() != "compute") {
+    if (!cfg.get<::intel_npu::NPUW_SPATIAL>() || f._tag != "compute") {
         LOG_VERB("No spatial optimizations will be done to  " << func_name << " in model " << model->get_friendly_name()
                                                               << "...");
         return;
@@ -1923,137 +1936,21 @@ void Partitioner::attention(const std::string& func_name) {
     ov::npuw::Function& f = P.functions.at(func_name);
 
     // Support only attention at the time
-    if (f.gettag() != "attn") {
+    if (f._tag != "attn") {
         LOG_VERB("No dynamic handling be done to  " << func_name << " in model " << model->get_friendly_name()
                                                     << "...");
         return;
     }
 
-    // Get attention mode from NPUW_ATTN config (string type)
-    const auto attn_mode = cfg.get<::intel_npu::NPUW_ATTN>();
-
-    // Check if attention optimization is disabled
-    if (attn_mode == "STATIC") {
-        LOG_VERB("Attention optimization disabled (STATIC mode) for " << func_name << " in model "
-                                                                      << model->get_friendly_name());
-        return;
-    }
-
-    LOG_VERB("Turn " << func_name << " into Attention block (mode: " << attn_mode << ") in model "
-                     << model->get_friendly_name() << "...");
+    LOG_VERB("Turn " << func_name << " into dynamic Attention block in model " << model->get_friendly_name() << "...");
     LOG_BLOCK();
 
-    // Try DYNAMIC attention
-    if (attn_mode == "DYNAMIC") {
-        f._attention = ov::npuw::function::Attention::from(f._model);
-        if (f._attention) {
-            LOG_VERB("Done - DYNAMIC attention");
-            return;
-        }
-        LOG_WARN("No dynamic ranges found in the ATTN block");
-    }
-
-    // Try PYRAMID attention
-    if (attn_mode == "PYRAMID") {
-        LOG_DEBUG("Attempting PyramidAttention based on config");
-        f._pyramid_attention = ov::npuw::function::PyramidAttention::from(f._model);
-        if (f._pyramid_attention) {
-            LOG_VERB("Done - PYRAMID attention");
-            return;
-        }
-        LOG_WARN("No pyramid attention found in the ATTN block");
-    }
-
-    // Try HFA (Host Flash Attention)
-    if (attn_mode == "HFA") {
-        LOG_DEBUG("Attempting HostFlashAttention based on config");
-        f._host_flash_attention =
-            ov::npuw::function::HostFlashAttention::from(f._model, cfg.get<::intel_npu::NPUW_ATTN_HFA_FUSED>());
-        if (f._host_flash_attention) {
-            LOG_VERB("Done - HFA (Host Flash Attention)");
-            return;
-        }
-        LOG_WARN("No host flash attention found in the ATTN block");
-    }
-}
-
-std::shared_ptr<ov::Model> Partitioner::getRouterModel() {
-    // Find and cache router model in context if not already cached
-    if (part_ctx.router_model != nullptr) {
-        return part_ctx.router_model;
-    }
-
-    for (const auto& [name, func] : P.functions) {
-        LOG_DEBUG("Checking function " << name << " with tag " << func.gettag());
-        if (func.gettag() != ov::npuw::patterns::moe::ROUTER_TAG) {
-            continue;
-        }
-
-        part_ctx.router_model = func._model;
-        LOG_INFO("Found router model: " << name);
-        break;
-    }
-
-    return part_ctx.router_model;
-}
-
-void Partitioner::transformMoeExperts(const std::string& func_name) {
-    ov::npuw::Function& f = P.functions.at(func_name);
-
-    // Only process functions tagged as "expert"
-    if (f.gettag() != ov::npuw::patterns::moe::EXPERT_TAG) {
+    f._attention = ov::npuw::function::Attention::from(f._model);
+    if (!f._attention) {
+        LOG_WARN("Do dynamic ranges found in the ATTN block");
         return;
     }
-
-    // Retrieve router model (required for extracting K from TopK node)
-    auto router_model = getRouterModel();
-    if (!router_model) {
-        LOG_WARN("Router model not available yet, skipping MoE expert transformation for " << func_name);
-        return;
-    }
-
-    LOG_DEBUG("Transforming " << func_name << " into MoE expert block in model " << model->get_friendly_name()
-                              << "...");
-    LOG_BLOCK();
-
-    // Determine compilation strategy from configuration:
-    // - moe_chunk_size = 0 (default): Compile multiple models for various chunk sizes
-    //   {16, 32, 64, 128, 256} to enable dynamic chunk selection at runtime
-    // - moe_chunk_size > 0: Compile a single model with the specified fixed chunk size
-    const auto moe_chunk_size = cfg.get<::intel_npu::NPUW_MOE_TOKEN_CHUNK_SIZE>();
-
-    // Create MoEExperts using factory method:
-    // - Analyzes expert model structure
-    // - Extracts K (number of active experts) from router model's TopK node
-    // - Generates optimized expert models for prefill and/or decoding stages
-    f._moe_experts = ov::npuw::function::MoEExperts::from(f._model, router_model, moe_chunk_size);
-}
-
-void Partitioner::transformMoeDownstream(const std::string& func_name) {
-    ov::npuw::Function& f = P.functions.at(func_name);
-
-    // Retrieve router model (required for extracting active expert count)
-    auto router_model = getRouterModel();
-    if (!router_model) {
-        LOG_WARN("Router model not available, skipping MoE downstream transformation for " << func_name);
-        return;
-    }
-
-    LOG_DEBUG("Attempting MoE downstream transformation for " << func_name << "...");
-    LOG_BLOCK();
-
-    // Detect and transform MoE downstream processing pattern:
-    // Expected pattern: Parameter[total_experts, 1, H, W] -> Convert -> ReduceSum
-    //
-    // Transformation:
-    // - Identifies parameters with expert dimension (first dimension = total_experts)
-    // - Reshapes from [total_experts, ...] to [active_experts, ...]
-    // - active_experts (K) is extracted from router model's TopK node
-    //
-    // Note: No tag-based filtering - pattern matching determines applicability
-    // This allows downstream processing to be detected in any function that follows
-    // the structural pattern, regardless of how it was originally tagged
-    f._moe_experts_downstream = ov::npuw::function::create_moe_downstream(f._model, router_model);
+    LOG_VERB("Done");
 }
 
 void Partitioner::optimize(const std::string& func_name) {
@@ -2636,13 +2533,8 @@ ov::npuw::Partitioning ov::npuw::getPartitioning(const std::shared_ptr<ov::Model
         if (cfg.get<::intel_npu::NPUW_FOLD>()) {
             // Do full-featured folding
             auto all_functions = p.initFunctionPipeline(Partitioner::FunctionPipelineType::FOLD);
-
-            // Pass 1: Register all functions and apply general transformations
-            // - matchRepeatedSubgraphs() populates P.functions with all function definitions
-            // - Other transformations (spatial, attention, optimize, etc.) can be applied
-            //   independently without cross-function dependencies
             for (auto&& func_group : all_functions) {
-                LOG_INFO("FOLD Pass 1: Register and transform function " << func_group << "...");
+                LOG_INFO("FOLD: Process function " << func_group << "...");
                 LOG_BLOCK();
                 p.propagateSlices(func_group);
                 p.propagateConverts(func_group);
@@ -2654,26 +2546,11 @@ ov::npuw::Partitioning ov::npuw::getPartitioning(const std::shared_ptr<ov::Model
                 p.saveTailDictConstants(func_group);
                 p.matchParameters(func_group);
                 p.matchResults(func_group);
-                p.matchRepeatedSubgraphs(func_group);  // This populates P.functions
+                p.matchRepeatedSubgraphs(func_group);
                 p.spatial(func_group);
                 p.attention(func_group);
                 p.optimize(func_group);
                 p.decompressionCutOff(func_group);
-            }
-
-            // Pass 2: MoE-specific transformations (requires all functions registered)
-            //
-            // Why separate pass?
-            // - transformMoeExperts() and transformMoeDownstream() require the "router" function
-            // - Router function must be found in P.functions (populated in Pass 1)
-            // - Processing order in Pass 1 is not guaranteed (router may come after experts)
-            // - Therefore, MoE transformations run in Pass 2 after all function registration
-            //   completes, ensuring router model is always available when needed
-            for (auto&& func_group : all_functions) {
-                LOG_INFO("FOLD Pass 2: MoE-specific transformations for " << func_group << "...");
-                LOG_BLOCK();
-                p.transformMoeExperts(func_group);
-                p.transformMoeDownstream(func_group);
             }
         } else if (cfg.get<::intel_npu::NPUW_CWAI>()) {
             // Less brutal version - just transform repeated blocks

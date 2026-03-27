@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <filesystem>
 #include <fstream>
 
 #include "openvino/core/log_util.hpp"
@@ -21,6 +22,10 @@ LogLevel get_log_level();
 bool debug_groups();
 
 bool profiling_enabled();
+
+bool force_dump_failures();
+
+std::filesystem::path failure_dump_dir();
 
 class __logging_indent__ {
     static thread_local int this_indent;

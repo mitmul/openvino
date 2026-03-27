@@ -134,6 +134,9 @@ private:
     void reconstruct_closure();
     // For weightless serialization flow
     void store_const_offsets(const std::shared_ptr<ov::Model>& model);
+    std::size_t num_submodels() const;
+    std::shared_ptr<weights::Bank> get_weights_bank() const;
+    void set_weights_bank(std::shared_ptr<weights::Bank> bank);
 
     void finalize_weights_bank();
     void detach_memory();
