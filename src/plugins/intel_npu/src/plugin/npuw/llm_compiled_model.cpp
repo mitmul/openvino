@@ -56,6 +56,55 @@ bool is_aligned_to(T value, T alignment) {
     return value % alignment == 0;
 }
 
+bool is_zero_dim_kv_result(const std::shared_ptr<ov::op::v0::Result>& result) {
+    const auto& input_names = result->input_value(0).get_names();
+    std::set<std::string> tensor_names(input_names.begin(), input_names.end());
+    const auto& result_tensor_names = result->get_output_tensor(0).get_names();
+    tensor_names.insert(result_tensor_names.begin(), result_tensor_names.end());
+
+    bool looks_like_kv = false;
+    for (const auto& name : tensor_names) {
+        if ((name.find("past_key_values") != std::string::npos || name.find("present.") != std::string::npos ||
+             name.find("output_restored.") != std::string::npos) &&
+            (name.find(".key") != std::string::npos || name.find(".value") != std::string::npos)) {
+            looks_like_kv = true;
+            break;
+        }
+    }
+    if (!looks_like_kv) {
+        return false;
+    }
+
+    const auto partial_shape = result->input_value(0).get_partial_shape();
+    if (partial_shape.rank().is_dynamic()) {
+        return false;
+    }
+
+    for (const auto& dim : partial_shape) {
+        if (!dim.is_dynamic() && dim.get_length() == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+size_t remove_zero_dim_kv_results(const std::shared_ptr<ov::Model>& model) {
+    std::vector<std::shared_ptr<ov::op::v0::Result>> results_to_remove;
+    for (const auto& result : model->get_results()) {
+        if (is_zero_dim_kv_result(result)) {
+            results_to_remove.push_back(result);
+        }
+    }
+
+    for (const auto& result : results_to_remove) {
+        model->remove_result(result);
+    }
+    if (!results_to_remove.empty()) {
+        model->validate_nodes_and_infer_types();
+    }
+    return results_to_remove.size();
+}
+
 }  // namespace
 
 class CutLMHead : public ov::pass::MatcherPass {
@@ -895,6 +944,8 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     if (!m_is_embedding) {
         if (!m_use_chunk_prefill) {
             NPUW_ASSERT(ov::npuw::RemoveEmptyKVInputs().run_on_model(prefill_model));
+            const auto removed_results = remove_zero_dim_kv_results(prefill_model);
+            LOG_DEBUG("Removed " << removed_results << " zero-dimension KV results from prefill model.");
         } else {
             LOG_DEBUG("Don't remove input key/values from prefill model.");
             LOG_DEBUG("Ask prefill model to output key/values for prefill chunk size tokens.");

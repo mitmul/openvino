@@ -51,6 +51,13 @@ void reshape_to_static(std::shared_ptr<ov::Model> model,
             const auto& partial_shape = input.get_partial_shape();
             new_shape = partial_shape;
             new_shape[0] = 1;  // batch_dim
+        } else if (input_name.find(".conv_state") != std::string::npos ||
+                   input_name.find(".ssm_state") != std::string::npos) {
+            // PLaMo Mamba states are not KV-cache tensors. Keep their internal history layout intact
+            // and only clamp the batch dimension to 1 for the prefill/generate static variants.
+            const auto& partial_shape = input.get_partial_shape();
+            new_shape = partial_shape;
+            new_shape[kv_axes_position.batch] = 1;
         } else if (ov::npuw::matchEagle3HiddenStatesString(input_name)) {
             new_shape = ov::npuw::Eagle3Extension::get_static_input(model, input, input_size);
         } else if (ov::npuw::util::matchLoRAMatMulAString(input_name)) {
