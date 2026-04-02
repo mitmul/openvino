@@ -204,12 +204,16 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
       m_cfg(m_options_desc),
       m_name(model->get_friendly_name()),
       m_loaded_from_cache(false) {
+    NPUW_COMPILE_TRACE_SCOPE("compiled_model/construct/" + m_name);
     init_profiling();
 
     // Note: we need to identify original bf16 constants for potential weightless deserialization later
     // And only then do bf16 to f16 transformation
     m_bf16_consts = ov::npuw::s11n::get_bf16_consts(model);
-    pre_load_transform(model, properties);
+    {
+        NPUW_COMPILE_TRACE_SCOPE("compiled_model/pre_load_transform");
+        pre_load_transform(model, properties);
+    }
 
     ::intel_npu::registerNPUWOptions(*m_options_desc);
 
@@ -254,16 +258,25 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
     }
 
     // Store original constants' offset for serialization purposes
-    store_const_offsets(model);
+    {
+        NPUW_COMPILE_TRACE_SCOPE("compiled_model/store_const_offsets");
+        store_const_offsets(model);
+    }
 
     ov::npuw::PartitioningContext ctx;
     // Identify based on compiler version, user config and pattern
-    ctx.use_host_gather_quant = should_use_quantized_host_gather(model, npuw_props);
+    {
+        NPUW_COMPILE_TRACE_SCOPE("compiled_model/should_use_quantized_host_gather");
+        ctx.use_host_gather_quant = should_use_quantized_host_gather(model, npuw_props);
+    }
 
     ov::npuw::Partitioning partitioning;
-    m_profile["partitioning"].record([&]() {
-        partitioning = getPartitioning(model, m_cfg, ctx);
-    });
+    {
+        NPUW_COMPILE_TRACE_SCOPE("compiled_model/partitioning");
+        m_profile["partitioning"].record([&]() {
+            partitioning = getPartitioning(model, m_cfg, ctx);
+        });
+    }
 
     m_total_stat.gflops = partitioning.total_gflops;
     m_total_stat.ops = partitioning.total_ops;
@@ -368,143 +381,146 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
     const std::string dump_sub_opt = m_cfg.get<::intel_npu::NPUW_DUMP_SUBS>();
 
     LOG_INFO("Creating submodels...");
-    for (std::size_t id = 0u; id < orderedSubgraphs.size(); id++) {
-        LOG_BLOCK();
-
-        const auto& subgraph = orderedSubgraphs[id];
-        m_compiled_submodels[id].stat.gflops = subgraph._gflops;
-        m_compiled_submodels[id].stat.ops = subgraph._ops;
-
-        if (subgraph._optimized_out) {
-            // FIXME: filter out the optimized out subgraph from this process early,
-            // only dispatch real compilation to the threads
-            LOG_INFO("Skipping Subgraph[" << id << "] - optimized out!");
-            continue;
-        }
-        LOG_INFO("Creating Subgraph[" << id << "]...");
-        if (subgraph._funcall.empty()) {
-            // NOT a function call - an easy case!
-            m_compiled_submodels[id].model = std::make_shared<ov::Model>(subgraph._results,
-                                                                         subgraph._sinks,
-                                                                         subgraph._parameters,
-                                                                         m_name + '_' + std::to_string(id));
-        } else {
+    {
+        NPUW_COMPILE_TRACE_SCOPE("compiled_model/create_submodels");
+        for (std::size_t id = 0u; id < orderedSubgraphs.size(); id++) {
             LOG_BLOCK();
-            auto& fcn_template = partitioning.functions.at(subgraph._funcall);
-            auto compiled_fcn_iter = compiledFunctions.find(subgraph._funcall);
-            if (compiled_fcn_iter == compiledFunctions.end()) {
-                // A function call: store the model for function call only once...
-                compiledFunctions.insert({subgraph._funcall, id});
 
-                // For HFA, use the final tile model instead of the original SDPA model
-                // because the original SDPA model won't be compiled
-                if (fcn_template._host_flash_attention) {
-                    m_compiled_submodels[id].model = fcn_template._host_flash_attention.value()._final_tile_model;
-                } else {
-                    m_compiled_submodels[id].model = fcn_template._model;
-                }
+            const auto& subgraph = orderedSubgraphs[id];
+            m_compiled_submodels[id].stat.gflops = subgraph._gflops;
+            m_compiled_submodels[id].stat.ops = subgraph._ops;
 
-                m_compiled_submodels[id].replaced_by = id;  // FIXME: UGLY
-
-                // Fill in the spatial information, if it is present
-                if (fcn_template._spatial) {
-                    m_compiled_submodels[id].spatial =
-                        compiled::Spatial(fcn_template._spatial.value(), fcn_template._model);
-                }
-                // Does the same for dynamic. FIXME: This selection should be hidden here
-                // in the object semantics
-                if (fcn_template._attention) {
-                    m_compiled_submodels[id].attention =
-                        compiled::Attention(fcn_template._attention.value(), fcn_template._model);
-                }
-
-                if (fcn_template._pyramid_attention) {
-                    LOG_INFO("Creating compiled::PyramidAttention for Subgraph[" << id << "] (function "
-                                                                                 << subgraph._funcall << ")");
-                    m_compiled_submodels[id].pyramid_attention =
-                        compiled::PyramidAttention(fcn_template._pyramid_attention.value());
-                }
-
-                if (fcn_template._host_flash_attention) {
-                    LOG_INFO("Creating compiled::HostFlashAttention for Subgraph[" << id << "] (function "
-                                                                                   << subgraph._funcall << ")");
-                    m_compiled_submodels[id].host_flash_attention =
-                        compiled::HostFlashAttention(fcn_template._host_flash_attention.value());
-                }
-
-                if (fcn_template._moe_experts) {
-                    m_compiled_submodels[id].moe_experts = compiled::MoEExperts(fcn_template._moe_experts.value());
-
-                    // Point model to first chunk size model (actual compilation handled by compile_moe_models)
-                    const auto& models_to_compile = m_compiled_submodels[id].moe_experts.value()._models_to_compile;
-                    NPUW_ASSERT(!models_to_compile.empty() && "Fatal: MoEExperts has no models to compile!");
-                    m_compiled_submodels[id].model = models_to_compile.begin()->second;
-                }
-
-                if (fcn_template._moe_experts_downstream) {
-                    m_compiled_submodels[id].moe_experts_downstream =
-                        compiled::MoEDownstream(fcn_template._moe_experts_downstream.value());
-
-                    // Set the model to compile from MoEDownstream
-                    m_compiled_submodels[id].model =
-                        m_compiled_submodels[id].moe_experts_downstream.value()._model_to_compile;
-                }
-
-                LOG_INFO("Subgraph[" << id << "] is a function body for " << subgraph._funcall);
+            if (subgraph._optimized_out) {
+                // FIXME: filter out the optimized out subgraph from this process early,
+                // only dispatch real compilation to the threads
+                LOG_INFO("Skipping Subgraph[" << id << "] - optimized out!");
+                continue;
+            }
+            LOG_INFO("Creating Subgraph[" << id << "]...");
+            if (subgraph._funcall.empty()) {
+                // NOT a function call - an easy case!
+                m_compiled_submodels[id].model = std::make_shared<ov::Model>(subgraph._results,
+                                                                             subgraph._sinks,
+                                                                             subgraph._parameters,
+                                                                             m_name + '_' + std::to_string(id));
             } else {
-                // ...and refer to it in other calls
-                m_compiled_submodels[id].replaced_by = compiled_fcn_iter->second;
-                LOG_INFO("Subgraph[" << id << "] is a function call to [" << compiled_fcn_iter->second << "]");
-            }
-            auto& closure_desc = m_compiled_submodels[id].closure.get();
+                LOG_BLOCK();
+                auto& fcn_template = partitioning.functions.at(subgraph._funcall);
+                auto compiled_fcn_iter = compiledFunctions.find(subgraph._funcall);
+                if (compiled_fcn_iter == compiledFunctions.end()) {
+                    // A function call: store the model for function call only once...
+                    compiledFunctions.insert({subgraph._funcall, id});
 
-            m_compiled_submodels[id].host_gather = subgraph._host_gather;
-            m_compiled_submodels[id].quant_unpack_gather = subgraph._quant_unpack_gather;
-            m_compiled_submodels[id].param_base = fcn_template._param_offset;
-            closure_desc.closure = subgraph._closure;
-            m_compiled_submodels[id].lazy_closure = subgraph._lazy_closure;
-            closure_desc.closure_uid.resize(subgraph._closure.size(), -1);
-            m_compiled_submodels[id].scales = subgraph._scales;
-            m_compiled_submodels[id].zerops = subgraph._zerops;
-            m_compiled_submodels[id].forced_to_fcall = subgraph._forced_to_fcall;
-            closure_desc.is_remote.resize(subgraph._closure.size(), false);
-        }  // if(!funcall)
+                    // For HFA, use the final tile model instead of the original SDPA model
+                    // because the original SDPA model won't be compiled
+                    if (fcn_template._host_flash_attention) {
+                        m_compiled_submodels[id].model = fcn_template._host_flash_attention.value()._final_tile_model;
+                    } else {
+                        m_compiled_submodels[id].model = fcn_template._model;
+                    }
 
-        if (!m_compiled_submodels[id].model && !m_compiled_submodels[id].replaced_by) {
-            OPENVINO_THROW("Fatal: submodel ", id, " is neither a model nor a function call!");
-        }
-        const std::size_t real_id = m_compiled_submodels[id].replaced_by.value_or(id);
+                    m_compiled_submodels[id].replaced_by = id;  // FIXME: UGLY
 
-        // FIXME: a hotfix for a crash where we have too many names in submodel's output
-        // Do it just once if that's a function
-        if (real_id == id) {
-            auto fix_tensor_names = [&](const std::shared_ptr<ov::Model>& model) {
-                if (model) {
-                    remove_long_output_names(model);
-                    fill_empty_tensor_names(model);
+                    // Fill in the spatial information, if it is present
+                    if (fcn_template._spatial) {
+                        m_compiled_submodels[id].spatial =
+                            compiled::Spatial(fcn_template._spatial.value(), fcn_template._model);
+                    }
+                    // Does the same for dynamic. FIXME: This selection should be hidden here
+                    // in the object semantics
+                    if (fcn_template._attention) {
+                        m_compiled_submodels[id].attention =
+                            compiled::Attention(fcn_template._attention.value(), fcn_template._model);
+                    }
+
+                    if (fcn_template._pyramid_attention) {
+                        LOG_INFO("Creating compiled::PyramidAttention for Subgraph[" << id << "] (function "
+                                                                                     << subgraph._funcall << ")");
+                        m_compiled_submodels[id].pyramid_attention =
+                            compiled::PyramidAttention(fcn_template._pyramid_attention.value());
+                    }
+
+                    if (fcn_template._host_flash_attention) {
+                        LOG_INFO("Creating compiled::HostFlashAttention for Subgraph[" << id << "] (function "
+                                                                                       << subgraph._funcall << ")");
+                        m_compiled_submodels[id].host_flash_attention =
+                            compiled::HostFlashAttention(fcn_template._host_flash_attention.value());
+                    }
+
+                    if (fcn_template._moe_experts) {
+                        m_compiled_submodels[id].moe_experts = compiled::MoEExperts(fcn_template._moe_experts.value());
+
+                        // Point model to first chunk size model (actual compilation handled by compile_moe_models)
+                        const auto& models_to_compile = m_compiled_submodels[id].moe_experts.value()._models_to_compile;
+                        NPUW_ASSERT(!models_to_compile.empty() && "Fatal: MoEExperts has no models to compile!");
+                        m_compiled_submodels[id].model = models_to_compile.begin()->second;
+                    }
+
+                    if (fcn_template._moe_experts_downstream) {
+                        m_compiled_submodels[id].moe_experts_downstream =
+                            compiled::MoEDownstream(fcn_template._moe_experts_downstream.value());
+
+                        // Set the model to compile from MoEDownstream
+                        m_compiled_submodels[id].model =
+                            m_compiled_submodels[id].moe_experts_downstream.value()._model_to_compile;
+                    }
+
+                    LOG_INFO("Subgraph[" << id << "] is a function body for " << subgraph._funcall);
+                } else {
+                    // ...and refer to it in other calls
+                    m_compiled_submodels[id].replaced_by = compiled_fcn_iter->second;
+                    LOG_INFO("Subgraph[" << id << "] is a function call to [" << compiled_fcn_iter->second << "]");
                 }
-            };
+                auto& closure_desc = m_compiled_submodels[id].closure.get();
 
-            // Fix tensor names for MoE expert models
-            if (const auto& moe_experts = m_compiled_submodels[real_id].moe_experts) {
-                for (const auto& [chunk_size, model] : moe_experts.value()._models_to_compile) {
-                    fix_tensor_names(model);
+                m_compiled_submodels[id].host_gather = subgraph._host_gather;
+                m_compiled_submodels[id].quant_unpack_gather = subgraph._quant_unpack_gather;
+                m_compiled_submodels[id].param_base = fcn_template._param_offset;
+                closure_desc.closure = subgraph._closure;
+                m_compiled_submodels[id].lazy_closure = subgraph._lazy_closure;
+                closure_desc.closure_uid.resize(subgraph._closure.size(), -1);
+                m_compiled_submodels[id].scales = subgraph._scales;
+                m_compiled_submodels[id].zerops = subgraph._zerops;
+                m_compiled_submodels[id].forced_to_fcall = subgraph._forced_to_fcall;
+                closure_desc.is_remote.resize(subgraph._closure.size(), false);
+            }  // if(!funcall)
+
+            if (!m_compiled_submodels[id].model && !m_compiled_submodels[id].replaced_by) {
+                OPENVINO_THROW("Fatal: submodel ", id, " is neither a model nor a function call!");
+            }
+            const std::size_t real_id = m_compiled_submodels[id].replaced_by.value_or(id);
+
+            // FIXME: a hotfix for a crash where we have too many names in submodel's output
+            // Do it just once if that's a function
+            if (real_id == id) {
+                auto fix_tensor_names = [&](const std::shared_ptr<ov::Model>& model) {
+                    if (model) {
+                        remove_long_output_names(model);
+                        fill_empty_tensor_names(model);
+                    }
+                };
+
+                // Fix tensor names for MoE expert models
+                if (const auto& moe_experts = m_compiled_submodels[real_id].moe_experts) {
+                    for (const auto& [chunk_size, model] : moe_experts.value()._models_to_compile) {
+                        fix_tensor_names(model);
+                    }
                 }
+
+                // Fix tensor names for pyramid attention models
+                if (const auto& pyramid_attn = m_compiled_submodels[real_id].pyramid_attention) {
+                    for (const auto& model : pyramid_attn.value()._models_to_compile) {
+                        fix_tensor_names(model);
+                    }
+                }
+
+                // Fix tensor names for main model (if not replaced by special models above)
+                fix_tensor_names(m_compiled_submodels[real_id].model);
             }
 
-            // Fix tensor names for pyramid attention models
-            if (const auto& pyramid_attn = m_compiled_submodels[real_id].pyramid_attention) {
-                for (const auto& model : pyramid_attn.value()._models_to_compile) {
-                    fix_tensor_names(model);
-                }
-            }
-
-            // Fix tensor names for main model (if not replaced by special models above)
-            fix_tensor_names(m_compiled_submodels[real_id].model);
-        }
-
-        dump_subgraph_model(id, subgraph._funcall, dump_sub_opt);
-    }  // for(orderedSubGraphs)
+            dump_subgraph_model(id, subgraph._funcall, dump_sub_opt);
+        }  // for(orderedSubGraphs)
+    }
 
 #ifdef NPU_PLUGIN_DEVELOPER_BUILD
     if (!dump_sub_opt.empty()) {
@@ -539,6 +555,7 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
     auto compile = [&](size_t i) {
         const auto& id = idx_subgraph_to_compile[i];
         const auto& subgraph = orderedSubgraphs[id];
+        NPUW_COMPILE_TRACE_SCOPE("compiled_model/compile_subgraph[" + std::to_string(id) + "]");
 
         NPUW_ASSERT(!subgraph._optimized_out);
 
@@ -595,18 +612,27 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
 
     // Parallel compilation is unstable so is disabled by default.
     const bool par_opt = m_cfg.get<::intel_npu::NPUW_PARALLEL_COMPILE>();
-    if (par_opt) {
-        ov::parallel_for(idx_subgraph_to_compile.size(), compile);
-    } else {
-        // TODO: Introduce npuw::serial(i, f) instead where f is a _funcall
-        for (std::size_t i = 0u; i < idx_subgraph_to_compile.size(); i++) {
-            compile(i);
+    {
+        NPUW_COMPILE_TRACE_SCOPE("compiled_model/compile_subgraphs");
+        if (par_opt) {
+            ov::parallel_for(idx_subgraph_to_compile.size(), compile);
+        } else {
+            // TODO: Introduce npuw::serial(i, f) instead where f is a _funcall
+            for (std::size_t i = 0u; i < idx_subgraph_to_compile.size(); i++) {
+                compile(i);
+            }
         }
     }
 
     // Finalize memory in closures and weight banks
-    finalize_weights_bank();
-    detach_memory();
+    {
+        NPUW_COMPILE_TRACE_SCOPE("compiled_model/finalize_weights_bank");
+        finalize_weights_bank();
+    }
+    {
+        NPUW_COMPILE_TRACE_SCOPE("compiled_model/detach_memory");
+        detach_memory();
+    }
 
     // Print stats report when possible
     {
@@ -615,8 +641,14 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
         log_device_dist();
     }
 
-    implement_properties();
-    report_io();
+    {
+        NPUW_COMPILE_TRACE_SCOPE("compiled_model/implement_properties");
+        implement_properties();
+    }
+    {
+        NPUW_COMPILE_TRACE_SCOPE("compiled_model/report_io");
+        report_io();
+    }
 }
 
 ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
@@ -1747,6 +1779,7 @@ void ov::npuw::CompiledModel::report_io() const {
 }
 
 bool ov::npuw::CompiledModel::compile_for_success(std::size_t id) {
+    NPUW_COMPILE_TRACE_SCOPE("compiled_model/compile_for_success[" + std::to_string(id) + "]");
     // Assume device_it is some always-valid starting point.
     // FIXME: And who guarantees it? Abstraction leaks are everywhere
     if (m_compiled_submodels[id].replaced_by && m_compiled_submodels[id].replaced_by != id) {
@@ -1771,6 +1804,7 @@ bool ov::npuw::CompiledModel::compile_for_success(std::size_t id) {
 }
 
 bool ov::npuw::CompiledModel::compile_for_device(std::size_t id, const std::string& device_to_try) {
+    NPUW_COMPILE_TRACE_SCOPE("compiled_model/compile_for_device[" + std::to_string(id) + "]/" + device_to_try);
     // The API of this method is ugly but it is what it is
     // NOTE(dm): Hetero plugin disables caching here, but we'll keep this to be done
     // at the individual plugins level.
@@ -1841,12 +1875,14 @@ void ov::npuw::CompiledModel::compile_main_model(std::size_t id, const std::stri
     }
 
     // Normal compilation for standard models
+    NPUW_COMPILE_TRACE_SCOPE("compiled_model/compile_main_model[" + std::to_string(id) + "]/" + device);
     m_profile["compile/" + device].record([&]() {
         m_compiled_submodels[id].compiled_model = compile_submodel(m_compiled_submodels[id].model, device);
     });
 }
 
 void ov::npuw::CompiledModel::compile_moe_models(std::size_t id, const std::string& device) {
+    NPUW_COMPILE_TRACE_SCOPE("compiled_model/compile_moe[" + std::to_string(id) + "]/" + device);
     // Check if we have MoE experts to compile
     if (auto& moe_experts_opt = m_compiled_submodels[id].moe_experts; moe_experts_opt.has_value()) {
         LOG_INFO("Compiling MoE expert models for different chunk sizes...");
@@ -1900,6 +1936,7 @@ void ov::npuw::CompiledModel::compile_pyramid_attention_models(std::size_t id, c
         return;
     }
 
+    NPUW_COMPILE_TRACE_SCOPE("compiled_model/compile_pyramid_attention[" + std::to_string(id) + "]/" + device);
     LOG_INFO("Compiling pyramid attention submodels for Subgraph[" << id << "]...");
     LOG_BLOCK();
 
@@ -1968,6 +2005,7 @@ void ov::npuw::CompiledModel::compile_host_flash_attention_model(std::size_t id,
         return;
     }
 
+    NPUW_COMPILE_TRACE_SCOPE("compiled_model/compile_host_flash_attention[" + std::to_string(id) + "]/" + device);
     LOG_INFO("Compiling host flash attention tile models for Subgraph[" << id << "]...");
     LOG_BLOCK();
 
@@ -2014,6 +2052,7 @@ void ov::npuw::CompiledModel::compile_host_flash_attention_model(std::size_t id,
 
 ov::SoPtr<ov::ICompiledModel> ov::npuw::CompiledModel::compile_submodel(const std::shared_ptr<ov::Model>& submodel,
                                                                         const std::string& device) {
+    NPUW_COMPILE_TRACE_SCOPE("compiled_model/compile_submodel/" + submodel->get_friendly_name() + "/" + device);
     auto plugin = get_npuw_plugin();
     auto core = plugin->get_core();
 

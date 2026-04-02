@@ -4,15 +4,16 @@
 
 #include "logging.hpp"
 
+#include <chrono>
 #include <ctime>
 #include <iomanip>
 #include <iostream>
 #include <mutex>
+#include <sstream>
 
 #include "openvino/runtime/make_tensor.hpp"  // get_tensor_impl
 
 namespace {
-#ifdef NPU_PLUGIN_DEVELOPER_BUILD
 const char* get_env(const std::vector<std::string>& list_to_try) {
     for (auto&& key : list_to_try) {
         const char* pstr = std::getenv(key.c_str());
@@ -21,12 +22,10 @@ const char* get_env(const std::vector<std::string>& list_to_try) {
     }
     return nullptr;
 }
-#endif
 }  // anonymous namespace
 
 ov::npuw::LogLevel ov::npuw::get_log_level() {
     static LogLevel log_level = LogLevel::None;
-#ifdef NPU_PLUGIN_DEVELOPER_BUILD
     static std::once_flag flag;
 
     std::call_once(flag, []() {
@@ -45,7 +44,6 @@ ov::npuw::LogLevel ov::npuw::get_log_level() {
             log_level = LogLevel::Debug;
         }
     });
-#endif
     return log_level;
 }
 
@@ -68,7 +66,6 @@ bool ov::npuw::debug_groups() {
 
 bool ov::npuw::profiling_enabled() {
     static bool do_profiling = false;
-#ifdef NPU_PLUGIN_DEVELOPER_BUILD
     static std::once_flag flag;
 
     std::call_once(flag, []() {
@@ -79,8 +76,40 @@ bool ov::npuw::profiling_enabled() {
         const std::string prof_str(prof_opt);
         do_profiling = (prof_str == "YES" || prof_str == "ON" || prof_str == "1");
     });
-#endif
     return do_profiling;
+}
+
+bool ov::npuw::compile_trace_enabled() {
+    static bool do_compile_trace = false;
+    static std::once_flag flag;
+
+    std::call_once(flag, []() {
+        const auto* trace_opt = get_env({"OPENVINO_NPUW_COMPILE_TRACE"});
+        if (!trace_opt) {
+            return;
+        }
+        const std::string trace_str(trace_opt);
+        do_compile_trace = (trace_str == "YES" || trace_str == "ON" || trace_str == "1");
+    });
+    return do_compile_trace;
+}
+
+std::uint32_t ov::npuw::compile_trace_heartbeat_sec() {
+    static std::uint32_t heartbeat_sec = 30;
+    static std::once_flag flag;
+
+    std::call_once(flag, []() {
+        const auto* heartbeat_opt = get_env({"OPENVINO_NPUW_COMPILE_TRACE_HEARTBEAT_SEC"});
+        if (!heartbeat_opt) {
+            return;
+        }
+        try {
+            heartbeat_sec = static_cast<std::uint32_t>(std::stoul(heartbeat_opt));
+        } catch (...) {
+            heartbeat_sec = 30;
+        }
+    });
+    return heartbeat_sec;
 }
 
 thread_local int ov::npuw::__logging_indent__::this_indent = 0;
@@ -95,6 +124,73 @@ ov::npuw::__logging_indent__::~__logging_indent__() {
 
 int ov::npuw::__logging_indent__::__level__() {
     return this_indent;
+}
+
+ov::npuw::ScopedCompileTrace::ScopedCompileTrace(std::string label)
+    : m_enabled(ov::npuw::compile_trace_enabled() && ov::npuw::get_log_level() >= ov::npuw::LogLevel::Info),
+      m_label(std::move(label)),
+      m_started_at(std::chrono::steady_clock::now()),
+      m_heartbeat_period(std::chrono::seconds(ov::npuw::compile_trace_heartbeat_sec())) {
+    if (!m_enabled) {
+        return;
+    }
+
+    log_phase("START", false);
+    if (m_heartbeat_period.count() > 0) {
+        m_heartbeat_thread = std::thread([this]() {
+            heartbeat_loop();
+        });
+    }
+}
+
+ov::npuw::ScopedCompileTrace::~ScopedCompileTrace() {
+    if (!m_enabled) {
+        return;
+    }
+
+    m_stop_requested.store(true);
+    m_heartbeat_cv.notify_all();
+    if (m_heartbeat_thread.joinable()) {
+        m_heartbeat_thread.join();
+    }
+
+    try {
+        log_phase("END  ", true);
+    } catch (...) {
+    }
+}
+
+void ov::npuw::ScopedCompileTrace::heartbeat_loop() {
+    while (!m_stop_requested.load()) {
+        std::unique_lock<std::mutex> lock(m_heartbeat_mutex);
+        if (m_heartbeat_cv.wait_for(lock, m_heartbeat_period, [this]() {
+                return m_stop_requested.load();
+            })) {
+            break;
+        }
+        lock.unlock();
+        log_phase("RUN  ", true);
+    }
+}
+
+void ov::npuw::ScopedCompileTrace::log_phase(const char* phase, bool include_elapsed_suffix) const {
+    if (ov::npuw::get_log_level() < ov::npuw::LogLevel::Info) {
+        return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    const auto elapsed = std::chrono::duration<double>(now - m_started_at).count();
+
+    std::stringstream log_stream;
+    log_stream << "[ NPUW:INFO ] " << phase << ' ' << m_label;
+    if (include_elapsed_suffix) {
+        log_stream << " (" << std::fixed << std::setprecision(3) << elapsed << "s";
+        if (std::string(phase) == "RUN  ") {
+            log_stream << " elapsed";
+        }
+        log_stream << ')';
+    }
+    ov::util::log_message(log_stream.str());
 }
 
 void ov::npuw::dump_tensor(const ov::SoPtr<ov::ITensor>& input, const std::string& base_path) {

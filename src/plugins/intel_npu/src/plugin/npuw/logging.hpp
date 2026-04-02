@@ -4,7 +4,13 @@
 
 #pragma once
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
 #include <fstream>
+#include <mutex>
+#include <thread>
 
 #include "openvino/core/log_util.hpp"
 #include "openvino/openvino.hpp"
@@ -22,6 +28,10 @@ bool debug_groups();
 
 bool profiling_enabled();
 
+bool compile_trace_enabled();
+
+std::uint32_t compile_trace_heartbeat_sec();
+
 class __logging_indent__ {
     static thread_local int this_indent;
 
@@ -38,6 +48,30 @@ void dump_input_list(const std::string& base_name, const std::vector<std::string
 void dump_output_list(const std::string& base_name, const std::vector<std::string>& base_output_names);
 
 void dump_failure(const std::shared_ptr<ov::Model>& model, const std::string& device, const char* extra);
+
+class ScopedCompileTrace {
+public:
+    explicit ScopedCompileTrace(std::string label);
+    ~ScopedCompileTrace();
+
+    ScopedCompileTrace(const ScopedCompileTrace&) = delete;
+    ScopedCompileTrace& operator=(const ScopedCompileTrace&) = delete;
+    ScopedCompileTrace(ScopedCompileTrace&&) = delete;
+    ScopedCompileTrace& operator=(ScopedCompileTrace&&) = delete;
+
+private:
+    void heartbeat_loop();
+    void log_phase(const char* phase, bool include_elapsed_suffix) const;
+
+    bool m_enabled = false;
+    std::string m_label;
+    std::chrono::steady_clock::time_point m_started_at = std::chrono::steady_clock::now();
+    std::chrono::seconds m_heartbeat_period{0};
+    std::atomic<bool> m_stop_requested{false};
+    mutable std::mutex m_heartbeat_mutex;
+    std::condition_variable m_heartbeat_cv;
+    std::thread m_heartbeat_thread;
+};
 }  // namespace npuw
 }  // namespace ov
 
@@ -61,6 +95,8 @@ void dump_failure(const std::shared_ptr<ov::Model>& model, const std::string& de
 #define LOG_VERB(str)  LOG_IMPL(str, Verbose, "VERB")
 
 #define LOG_BLOCK() ov::npuw::__logging_indent__ object_you_should_never_use__##__LINE__
+#define NPUW_COMPILE_TRACE_SCOPE(label) \
+    ov::npuw::ScopedCompileTrace npuw_compile_trace_scope__##__LINE__(label)
 
 #define NPUW_ASSERT(expr)                                       \
     do {                                                        \

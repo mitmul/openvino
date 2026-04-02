@@ -139,6 +139,9 @@ private:
                                          const ov::AnyMap& generate_config);
 
     bool m_is_eagle = false;
+
+    using MS = ov::npuw::perf::metric<ov::npuw::perf::MSec>;
+    ov::npuw::perf::Profile<MS> m_profile;
 };
 
 }  // namespace npuw

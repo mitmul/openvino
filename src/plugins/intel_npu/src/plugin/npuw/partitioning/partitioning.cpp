@@ -1199,19 +1199,67 @@ void Partitioner::sanityCheck(const std::string& func_name) {
     LOG_DEBUG("The function has " << rep_block.matches.size() << " operation banks and " << rep_block.consts.size()
                                   << " constant banks");
 
-    auto validate = [&func_group](const ov::npuw::RepeatedBlock::MatchedLayers& lrs) -> bool {
+    auto describe_layers = [](const ov::npuw::RepeatedBlock::MatchedLayers& lrs) -> std::string {
+        constexpr std::size_t kPreviewLimit = 12;
+        std::string description = "[";
+        std::size_t idx = 0u;
+        for (const auto& layer_name : lrs) {
+            if (idx > 0u) {
+                description += ", ";
+            }
+            if (idx >= kPreviewLimit) {
+                description += "...";
+                break;
+            }
+            description += layer_name;
+            ++idx;
+        }
+        description += "]";
+        return description;
+    };
+    auto throw_bank_mismatch =
+        [&](const char* bank_kind,
+            const std::size_t bank_idx,
+            const ov::npuw::RepeatedBlock::MatchedLayers& lrs,
+            const std::size_t expected_size,
+            const std::string& extra = {}) -> void {
+        std::string extra_message;
+        if (!extra.empty()) {
+            extra_message = " ";
+            extra_message += extra;
+        }
+        OPENVINO_THROW("NPUW repeated-block sanity check failed in model ",
+                       model->get_friendly_name(),
+                       " for function ",
+                       func_name,
+                       ": ",
+                       bank_kind,
+                       " bank #",
+                       bank_idx,
+                       " has ",
+                       lrs.size(),
+                       " entries but expected ",
+                       expected_size,
+                       ". Layers=",
+                       describe_layers(lrs),
+                       extra_message);
+    };
+
+    auto validate = [&](const char* bank_kind,
+                        const std::size_t bank_idx,
+                        const ov::npuw::RepeatedBlock::MatchedLayers& lrs) -> void {
         for (auto&& l : lrs) {
             LOG_DEBUG(l);
         }
         if (lrs.size() != func_group.refs.size()) {
             LOG_WARN("Number of layers in match bank differs from # of function calls: " << lrs.size() << " != "
                                                                                          << func_group.refs.size());
-            return false;
+            throw_bank_mismatch(bank_kind, bank_idx, lrs, func_group.refs.size());
         }
         LOG_DEBUG("Validation passed");
-        return true;
     };
-    auto validate_scalars = [&](const ov::npuw::RepeatedBlock::MatchedLayers& lrs) -> bool {
+    auto validate_scalars =
+        [&](const std::size_t bank_idx, const ov::npuw::RepeatedBlock::MatchedLayers& lrs) -> void {
         for (auto&& l : lrs) {
             LOG_DEBUG(l);
         }
@@ -1225,30 +1273,32 @@ void Partitioner::sanityCheck(const std::string& func_name) {
                      << "<OR> # of function calls including duplicate scalars: " << lrs.size()
                      << " != " << func_group.refs.size() << " OR " << lrs.size() + f_dup_scalars
                      << " != " << func_group.refs.size());
-            return false;
+            throw_bank_mismatch("scalar",
+                                bank_idx,
+                                lrs,
+                                func_group.refs.size(),
+                                "duplicate_scalar_matches=" + std::to_string(f_dup_scalars));
         }
         LOG_DEBUG("Validation passed");
-        return true;
     };
-    bool all_ok = true;
+    std::size_t bank_idx = 0u;
     for (auto& bank : rep_block.matches) {
         LOG_DEBUG("Validating operation bank...");
         LOG_BLOCK();
-        all_ok &= validate(bank);
+        validate("operation", bank_idx++, bank);
     }
-    NPUW_ASSERT(all_ok);
+    bank_idx = 0u;
     for (auto& bank : rep_block.consts) {
         LOG_DEBUG("Validating const bank...");
         LOG_BLOCK();
-        all_ok &= validate(bank);
+        validate("const", bank_idx++, bank);
     }
-    NPUW_ASSERT(all_ok);
+    bank_idx = 0u;
     for (auto& bank : rep_block.scalars) {
         LOG_DEBUG("Validating scalar bank...");
         LOG_BLOCK();
-        all_ok &= validate_scalars(bank);
+        validate_scalars(bank_idx++, bank);
     }
-    NPUW_ASSERT(all_ok);
     // All Consts in all submodels should be registered at this point
     auto& consts = rep_block.consts;
     auto& scalars = rep_block.scalars;
@@ -1273,11 +1323,16 @@ void Partitioner::sanityCheck(const std::string& func_name) {
                               << reader_input.get_node()->get_friendly_name() << " / " << reader_input.get_index()
                               << (this_model_nodes.count(reader_input.get_node()) > 0 ? " [internal]" : " [external]"));
                 }
-                all_ok = false;
+                OPENVINO_THROW("NPUW repeated-block sanity check failed in model ",
+                               model->get_friendly_name(),
+                               " for function ",
+                               func_name,
+                               ": constant ",
+                               node->get_friendly_name(),
+                               " was not found in any repeated-bank registry");
             }
         }
     }
-    NPUW_ASSERT(all_ok);
     LOG_VERB("Done");
 }
 
