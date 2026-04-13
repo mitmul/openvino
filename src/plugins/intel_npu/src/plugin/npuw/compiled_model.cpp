@@ -8,6 +8,7 @@
 #include <memory>
 #include <set>
 #include <string>
+#include <unordered_set>
 
 #include "accuracy/comparator.hpp"
 #include "intel_npu/npu_private_properties.hpp"
@@ -58,6 +59,84 @@ std::map<std::string, std::string> any_copy(const ov::AnyMap& params) {
         result.emplace(value.first, value.second.as<std::string>());
     }
     return result;
+}
+
+void append_missing_reachable_parameters(const ov::ResultVector& results,
+                                         const ov::SinkVector& sinks,
+                                         ov::ParameterVector& parameters,
+                                         const std::string& model_name) {
+    std::unordered_set<const ov::Node*> known_params;
+    known_params.reserve(parameters.size());
+    for (const auto& param : parameters) {
+        known_params.insert(param.get());
+    }
+
+    std::unordered_set<const ov::Node*> visited;
+    std::vector<std::shared_ptr<ov::Node>> stack;
+    auto push_node = [&](const std::shared_ptr<ov::Node>& node) {
+        if (node && visited.insert(node.get()).second) {
+            stack.push_back(node);
+        }
+    };
+
+    for (const auto& result : results) {
+        push_node(result);
+    }
+    for (const auto& sink : sinks) {
+        push_node(sink);
+    }
+
+    ov::ParameterVector missing_params;
+    while (!stack.empty()) {
+        auto node = stack.back();
+        stack.pop_back();
+
+        if (auto param = ov::as_type_ptr<ov::op::v0::Parameter>(node)) {
+            if (known_params.insert(param.get()).second) {
+                missing_params.push_back(param);
+            }
+        }
+
+        for (const auto& input : node->inputs()) {
+            push_node(input.get_source_output().get_node_shared_ptr());
+        }
+    }
+
+    if (!missing_params.empty()) {
+        std::sort(missing_params.begin(),
+                  missing_params.end(),
+                  [](const auto& lhs, const auto& rhs) {
+                      return lhs->get_friendly_name() < rhs->get_friendly_name();
+                  });
+        LOG_WARN("Appending " << missing_params.size() << " reachable but undeclared Parameter node(s) while "
+                              << "constructing model " << model_name);
+        parameters.insert(parameters.end(), missing_params.begin(), missing_params.end());
+    }
+}
+
+void ensure_all_parameter_nodes_are_registered(const std::shared_ptr<ov::Model>& model) {
+    std::unordered_set<const ov::Node*> registered_params;
+    for (const auto& param : model->get_parameters()) {
+        registered_params.insert(param.get());
+    }
+
+    ov::ParameterVector missing_params;
+    for (const auto& node : model->get_ordered_ops()) {
+        auto param = ov::as_type_ptr<ov::op::v0::Parameter>(node);
+        if (!param || registered_params.count(param.get()) != 0) {
+            continue;
+        }
+
+        missing_params.push_back(param);
+        registered_params.insert(param.get());
+    }
+
+    if (!missing_params.empty()) {
+        LOG_WARN("Registering " << missing_params.size() << " undeclared Parameter node(s) for model "
+                                << model->get_friendly_name());
+        model->add_parameters(missing_params);
+        model->validate_nodes_and_infer_types();
+    }
 }
 }  // anonymous namespace
 
@@ -357,10 +436,14 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
         LOG_INFO("Creating Subgraph[" << id << "]...");
         if (subgraph._funcall.empty()) {
             // NOT a function call - an easy case!
-            m_compiled_submodels[id].model = std::make_shared<ov::Model>(subgraph._results,
-                                                                         subgraph._sinks,
-                                                                         subgraph._parameters,
-                                                                         m_name + '_' + std::to_string(id));
+            auto subgraph_parameters = subgraph._parameters;
+            const auto subgraph_name = m_name + '_' + std::to_string(id);
+            append_missing_reachable_parameters(subgraph._results,
+                                                subgraph._sinks,
+                                                subgraph_parameters,
+                                                subgraph_name);
+            m_compiled_submodels[id].model =
+                std::make_shared<ov::Model>(subgraph._results, subgraph._sinks, subgraph_parameters, subgraph_name);
         } else {
             LOG_BLOCK();
             auto& fcn_template = partitioning.functions.at(subgraph._funcall);
@@ -540,6 +623,8 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
                 m_compiled_submodels[real_id].device_it = forced_dev_it;
             }
         }  // if(forced_device_opt)
+
+        ensure_all_parameter_nodes_are_registered(m_compiled_submodels[real_id].model);
 
         LOG_INFO("Compiling Subgraph[" << id << "]: " << m_compiled_submodels[real_id].model->get_friendly_name()
                                        << "...");
@@ -1991,6 +2076,8 @@ ov::SoPtr<ov::ICompiledModel> ov::npuw::CompiledModel::compile_submodel(const st
                                                                         const std::string& device) {
     auto plugin = get_npuw_plugin();
     auto core = plugin->get_core();
+
+    ensure_all_parameter_nodes_are_registered(submodel);
 
     // set exclusive_async_requests in case when model is split
     // NOTE(dm): Not sure if it is required for the NPUW plugin, but likely it is

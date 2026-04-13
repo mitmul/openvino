@@ -5,6 +5,7 @@
 #include "partitioning.hpp"
 
 #include <memory>
+#include <unordered_set>
 
 #include "../logging.hpp"
 #include "../util.hpp"
@@ -54,6 +55,93 @@ struct hash<ov::Output<ov::Node>> {
 };
 }  // namespace std
 namespace {
+
+void append_missing_reachable_parameters(const ov::ResultVector& results,
+                                         const ov::SinkVector& sinks,
+                                         ov::ParameterVector& parameters,
+                                         const std::string& model_name) {
+    std::unordered_set<const ov::Node*> known_params;
+    known_params.reserve(parameters.size());
+    for (const auto& param : parameters) {
+        known_params.insert(param.get());
+    }
+
+    std::unordered_set<const ov::Node*> visited;
+    std::vector<std::shared_ptr<ov::Node>> stack;
+    auto push_node = [&](const std::shared_ptr<ov::Node>& node) {
+        if (node && visited.insert(node.get()).second) {
+            stack.push_back(node);
+        }
+    };
+
+    for (const auto& result : results) {
+        push_node(result);
+    }
+    for (const auto& sink : sinks) {
+        push_node(sink);
+    }
+
+    ov::ParameterVector missing_params;
+    while (!stack.empty()) {
+        auto node = stack.back();
+        stack.pop_back();
+
+        if (auto param = ov::as_type_ptr<ov::op::v0::Parameter>(node)) {
+            if (known_params.insert(param.get()).second) {
+                missing_params.push_back(param);
+            }
+        }
+
+        for (const auto& input : node->inputs()) {
+            push_node(input.get_source_output().get_node_shared_ptr());
+        }
+    }
+
+    if (!missing_params.empty()) {
+        std::sort(missing_params.begin(),
+                  missing_params.end(),
+                  [](const auto& lhs, const auto& rhs) {
+                      return lhs->get_friendly_name() < rhs->get_friendly_name();
+                  });
+        LOG_WARN("Appending " << missing_params.size() << " reachable but undeclared Parameter node(s) while "
+                              << "constructing model " << model_name);
+        parameters.insert(parameters.end(), missing_params.begin(), missing_params.end());
+    }
+}
+
+bool is_f16ic_boundary_convert(const std::shared_ptr<ov::Node>& node) {
+    if (!node || !ov::is_type<ov::op::v0::Convert>(node)) {
+        return false;
+    }
+    if (!ov::npuw::util::starts_with(node->get_friendly_name(), "Convert_f16ic_")) {
+        return false;
+    }
+    return ov::op::util::is_parameter(node->input(0).get_source_output().get_node_shared_ptr());
+}
+
+void ensure_all_parameter_nodes_are_registered(const std::shared_ptr<ov::Model>& model) {
+    std::unordered_set<const ov::Node*> known_params;
+    for (const auto& param : model->get_parameters()) {
+        known_params.insert(param.get());
+    }
+
+    ov::ParameterVector missing_params;
+    for (const auto& node : model->get_ordered_ops()) {
+        auto param = ov::as_type_ptr<ov::op::v0::Parameter>(node);
+        if (!param || known_params.count(param.get()) != 0) {
+            continue;
+        }
+        missing_params.push_back(param);
+        known_params.insert(param.get());
+    }
+
+    if (!missing_params.empty()) {
+        LOG_WARN("Registering " << missing_params.size() << " undeclared Parameter node(s) for model "
+                                << model->get_friendly_name());
+        model->add_parameters(missing_params);
+        model->validate_nodes_and_infer_types();
+    }
+}
 
 class FuncallEverywhere {
     std::shared_ptr<ov::Model> m_model;
@@ -267,7 +355,11 @@ private:
         LOG_DEBUG("Call: " << call.size());
         for (auto&& c : call) {
             LOG_BLOCK();
-            auto p_c = call_to_proto.at(typename M::key_type(func_ref, c));
+            auto it = call_to_proto.find(typename M::key_type(func_ref, c));
+            if (it == call_to_proto.end()) {
+                OPENVINO_THROW("Couldn't resolve prototype mapping for repeated-subgraph call");
+            }
+            auto p_c = it->second;
             to_proto.push_back(p_c);
             LOG_DEBUG(c << " (which is " << p_c << ")");
         }
@@ -362,6 +454,7 @@ private:
     std::size_t m_f16ic_counter = 0u;
 
     std::shared_ptr<ov::Node> new_f16ic_cvt(ov::Output<ov::Node> out, ov::element::Type type);
+    std::string resolve_prototype_name(const std::string& layer_name) const;
 };
 
 std::shared_ptr<ov::Node> Partitioner::new_f16ic_cvt(ov::Output<ov::Node> out, ov::element::Type type) {
@@ -381,7 +474,35 @@ std::shared_ptr<ov::Node> Partitioner::new_f16ic_cvt(ov::Output<ov::Node> out, o
     // original model(s), but the probability is quite low here.
     auto new_src = std::make_shared<ov::op::v0::Convert>(out, type);
     new_src->set_friendly_name("Convert_f16ic_" + std::to_string(m_f16ic_counter++));
+    layer_to_prototype[new_src->get_friendly_name()] = out.get_node_shared_ptr()->get_friendly_name();
     return new_src;
+}
+
+std::string Partitioner::resolve_prototype_name(const std::string& layer_name) const {
+    std::string current = layer_name;
+    std::unordered_set<std::string> visited;
+    while (true) {
+        const auto iter = layer_to_prototype.find(current);
+        if (iter == layer_to_prototype.end()) {
+            std::stringstream ss;
+            ss << "Failed to resolve prototype name for layer " << layer_name
+               << " while looking for " << current;
+            const auto msg = ss.str();
+            LOG_ERROR(msg);
+            throw std::out_of_range(msg);
+        }
+        if (iter->second == current) {
+            return current;
+        }
+        if (!visited.insert(current).second) {
+            std::stringstream ss;
+            ss << "Cycle detected while resolving prototype name for layer " << layer_name;
+            const auto msg = ss.str();
+            LOG_ERROR(msg);
+            throw std::runtime_error(msg);
+        }
+        current = iter->second;
+    }
 }
 
 struct Precalculated_Bound_Const {
@@ -817,11 +938,14 @@ std::vector<std::string> Partitioner::initFunctionPipeline(FunctionPipelineType 
                                                                    // every function gets its own id
             auto& u = all_functions[fcid];
             u.refs.push_back(std::ref(part_sg));
+            auto parameters = part_sg._parameters;
+            const auto model_name = model->get_friendly_name() + "_" + part_sg._repeated_id + pfix;
+            append_missing_reachable_parameters(part_sg._results, part_sg._sinks, parameters, model_name);
             u.mdls.push_back(
                 std::make_shared<ov::Model>(part_sg._results,
                                             part_sg._sinks,
-                                            part_sg._parameters,
-                                            model->get_friendly_name() + "_" + part_sg._repeated_id + pfix));
+                                            parameters,
+                                            model_name));
         }
     }
 
@@ -912,7 +1036,17 @@ void Partitioner::propagate(const std::string& func_name,
                 for (auto&& this_reader_iport : node_ptr->output(0).get_target_inputs()) {
                     LOG_BLOCK();
                     LOG_DEBUG("Read by " << this_reader_iport);
-                    if (this_model_nodes.count(this_reader_iport.get_node()) == 0) {
+                    auto reader_node = this_reader_iport.get_node()->shared_from_this();
+                    if (is_f16ic_boundary_convert(reader_node)) {
+                        for (auto&& next_reader_iport : reader_node->output(0).get_target_inputs()) {
+                            if (this_model_nodes.count(next_reader_iport.get_node()) == 0) {
+                                continue;
+                            }
+                            this_node_readers.insert(
+                                ProtoReader{next_reader_iport.get_node()->get_friendly_name(),
+                                            next_reader_iport.get_index()});
+                        }
+                    } else if (this_model_nodes.count(this_reader_iport.get_node()) == 0) {
                         LOG_BLOCK();
                         LOG_DEBUG("Link to the external reader (other submodel?) - skip");
                     } else {
@@ -925,7 +1059,7 @@ void Partitioner::propagate(const std::string& func_name,
                     LOG_BLOCK();
                     LOG_DEBUG("Looking for proto of reader " << this_node_reader.first);
                     this_node_proto_readers.insert(
-                        {layer_to_prototype.at(this_node_reader.first), this_node_reader.second});
+                        {resolve_prototype_name(this_node_reader.first), this_node_reader.second});
                 }
                 auto bank_writer_iter = proto_writer_of.find(this_node_proto_readers);
                 if (bank_writer_iter == proto_writer_of.end()) {
@@ -1151,7 +1285,7 @@ void Partitioner::propagateConvertsOut(const std::string& func_name) {
                                            writer_out.get_index()};
 
                 LOG_DEBUG("Looking for proto accessess...");
-                ProtoWriter this_proto_writer = {layer_to_prototype.at(this_writer.first), this_writer.second};
+                ProtoWriter this_proto_writer = {resolve_prototype_name(this_writer.first), this_writer.second};
                 auto bank_writer_iter = proto_reader_of.find(this_proto_writer);
                 if (bank_writer_iter == proto_reader_of.end()) {
                     // Register a new occasion
@@ -1537,7 +1671,18 @@ void Partitioner::matchParameters(const std::string& func_name) {
             if (ov::op::util::is_parameter(node)) {
                 PKey pkey;
                 for (auto&& iport : node->output(0).get_target_inputs()) {
-                    if (this_model_nodes.count(iport.get_node()) > 0) {
+                    auto reader_node = iport.get_node()->shared_from_this();
+                    if (is_f16ic_boundary_convert(reader_node)) {
+                        for (auto&& next_reader_iport : reader_node->output(0).get_target_inputs()) {
+                            if (this_model_nodes.count(next_reader_iport.get_node()) == 0) {
+                                continue;
+                            }
+                            LOG_DEBUG("Register link " << next_reader_iport.get_node()->get_friendly_name() << " : "
+                                                       << next_reader_iport.get_index());
+                            pkey.insert(PReader{next_reader_iport.get_node()->get_friendly_name(),
+                                                next_reader_iport.get_index()});
+                        }
+                    } else if (this_model_nodes.count(iport.get_node()) > 0) {
                         LOG_DEBUG("Register link " << iport.get_node()->get_friendly_name() << " : "
                                                    << iport.get_index());
                         pkey.insert(PReader{iport.get_node()->get_friendly_name(), iport.get_index()});
@@ -1567,15 +1712,42 @@ void Partitioner::matchParameters(const std::string& func_name) {
             if (ov::op::util::is_parameter(node)) {
                 PKey pkey;
                 for (auto&& iport : node->output(0).get_target_inputs()) {
-                    if (this_model_nodes.count(iport.get_node()) > 0) {
+                    auto reader_node = iport.get_node()->shared_from_this();
+                    if (is_f16ic_boundary_convert(reader_node)) {
+                        for (auto&& next_reader_iport : reader_node->output(0).get_target_inputs()) {
+                            if (this_model_nodes.count(next_reader_iport.get_node()) == 0) {
+                                continue;
+                            }
+                            LOG_DEBUG("Register link " << next_reader_iport.get_node()->get_friendly_name() << " : "
+                                                       << next_reader_iport.get_index());
+                            pkey.insert(PReader{resolve_prototype_name(next_reader_iport.get_node()->get_friendly_name()),
+                                                next_reader_iport.get_index()});
+                        }
+                    } else if (this_model_nodes.count(iport.get_node()) > 0) {
                         LOG_DEBUG("Register link " << iport.get_node()->get_friendly_name() << " : "
                                                    << iport.get_index());
-                        pkey.insert(PReader{_(layer_to_prototype).at(iport.get_node()->get_friendly_name()),
+                        pkey.insert(PReader{resolve_prototype_name(iport.get_node()->get_friendly_name()),
                                             iport.get_index()});
                     }
                 }
                 LOG_DEBUG("Find orig parameter for " << node);
-                auto& orig_param = proto_parameters.at(pkey);
+                auto proto_param_it = proto_parameters.find(pkey);
+                if (proto_param_it == proto_parameters.end()) {
+                    std::stringstream ss;
+                    for (const auto& reader : pkey) {
+                        if (ss.tellp() > 0) {
+                            ss << ", ";
+                        }
+                        ss << reader.first << ":" << reader.second;
+                    }
+                    OPENVINO_THROW("Couldn't resolve prototype parameter for node ",
+                                   node->get_friendly_name(),
+                                   " with ",
+                                   pkey.size(),
+                                   " reader link(s): ",
+                                   ss.str());
+                }
+                auto& orig_param = proto_param_it->second;
                 auto this_param = std::dynamic_pointer_cast<PPtr::element_type>(node);
                 func.param_call_to_proto[SubgParam(subg_ref, this_param)] = orig_param;
             }
@@ -1621,8 +1793,15 @@ void Partitioner::matchResults(const std::string& func_name) {
         for (auto&& node : call->get_ordered_ops()) {
             if (ov::op::util::is_output(node)) {
                 auto&& port = node->input(0).get_source_output();
-                RKey rkey = {layer_to_prototype.at(port.get_node()->get_friendly_name()), port.get_index()};
-                auto& orig_result = proto_results.at(rkey);
+                RKey rkey = {resolve_prototype_name(port.get_node()->get_friendly_name()), port.get_index()};
+                auto proto_result_it = proto_results.find(rkey);
+                if (proto_result_it == proto_results.end()) {
+                    OPENVINO_THROW("Couldn't resolve prototype result for writer ",
+                                   rkey.first,
+                                   " / ",
+                                   rkey.second);
+                }
+                auto& orig_result = proto_result_it->second;
                 auto this_result = std::dynamic_pointer_cast<RPtr::element_type>(node);
                 func.result_call_to_proto[SubgResult(subg_ref, this_result)] = orig_result;
             }
@@ -1640,6 +1819,17 @@ void Partitioner::createFunction(FunctionPipeline& func_ggg) {
     LOG_VERB("Registering a new function " << func_name << "...");
     LOG_BLOCK();
 
+    auto function_model = func_ggg.mdls.front();
+    ensure_all_parameter_nodes_are_registered(function_model);
+    for (const auto& param : function_model->get_parameters()) {
+        if (std::find(body_sg._parameters.begin(), body_sg._parameters.end(), param) == body_sg._parameters.end()) {
+            LOG_WARN("Registering late Parameter " << param->get_friendly_name()
+                                                   << " into repeated subgraph descriptor for function "
+                                                   << func_name);
+            body_sg._parameters.push_back(param);
+        }
+    }
+
     ov::npuw::Subgraph funcall{};
     std::swap(body_sg._funcall, body_sg._repeated_id);  // FIXME: unclear
 
@@ -1655,7 +1845,7 @@ void Partitioner::createFunction(FunctionPipeline& func_ggg) {
 
     // Declare a new function AND record a function call
     ov::npuw::Function function;
-    function._model = func_ggg.mdls.front();
+    function._model = function_model;
     function._param_offset = body_sg._parameters.size();
     function.settag(body_sg.gettag());
     std::size_t new_param_idx = function._param_offset;
@@ -1845,20 +2035,27 @@ void Partitioner::matchRepeatedSubgraphs(const std::string& func_name) {
         auto tmp_model = *mod_iter;
         for (auto&& node_ptr : tmp_model->get_ordered_ops()) {
             if (ov::op::util::is_parameter(node_ptr) || ov::op::util::is_constant(node_ptr) ||
-                ov::op::util::is_output(node_ptr)) {
+                ov::op::util::is_output(node_ptr) || is_f16ic_boundary_convert(node_ptr)) {
                 // Skip Parameter, Const, and Result layers from bank matching
                 continue;
             }
 
             const auto& this_layer_name = node_ptr->get_friendly_name();
-            const auto& proto_layer_name = layer_to_prototype.at(this_layer_name);  // (t)/1/a
+            const auto proto_layer_name = resolve_prototype_name(this_layer_name);  // (t)/1/a
 
             for (auto&& input_desc : node_ptr->inputs()) {
                 const auto& prod_output = input_desc.get_source_output();
                 const auto input_node = prod_output.get_node_shared_ptr();
                 if (ov::op::util::is_constant(input_node) && func_ggg.consts_to_keep.count(input_node) == 0) {
-                    auto param_idx = function._param_mapping.at(
-                        std::make_pair(proto_layer_name, input_desc.get_index()));  // (t)/1/b
+                    auto param_mapping_it = function._param_mapping.find(std::make_pair(proto_layer_name,
+                                                                                        input_desc.get_index()));
+                    if (param_mapping_it == function._param_mapping.end()) {
+                        OPENVINO_THROW("Couldn't resolve function parameter mapping for prototype layer ",
+                                       proto_layer_name,
+                                       " / input ",
+                                       input_desc.get_index());
+                    }
+                    auto param_idx = param_mapping_it->second;  // (t)/1/b
                     LOG_DEBUG("Register " << prod_output << " in the function closure[" << param_idx
                                           << "] (via prototype " << proto_layer_name << ")");
                     funcall._lazy_closure[param_idx - function._param_offset] =
@@ -2508,7 +2705,14 @@ void Partitioner::finalizeLinks() {
             auto& params = P.functions.at(sg_desc._funcall)._model->get_parameters();
             auto& proto = func_pipeline_type == FunctionPipelineType::CWAI
                               ? ptr  // no protos in the CWAI case..
-                              : all_functions.at(sg_desc._funcall).param_call_to_proto.at(SubgParam(sg_desc, ptr));
+                              : [&]() -> PPtr& {
+                                    auto& call_to_proto = all_functions.at(sg_desc._funcall).param_call_to_proto;
+                                    auto it = call_to_proto.find(SubgParam(sg_desc, ptr));
+                                    if (it == call_to_proto.end()) {
+                                        OPENVINO_THROW("Couldn't resolve subgraph parameter to prototype mapping");
+                                    }
+                                    return it->second;
+                                }();
             auto param_iter = std::find(params.begin(), params.end(), proto);
             NPUW_ASSERT(param_iter != params.end());
             return std::distance(params.begin(), param_iter);
@@ -2529,7 +2733,14 @@ void Partitioner::finalizeLinks() {
             auto& results = P.functions.at(sg_desc._funcall)._model->get_results();
             auto& proto = func_pipeline_type == FunctionPipelineType::CWAI
                               ? ptr  // no protos in the CWAI case...
-                              : all_functions.at(sg_desc._funcall).result_call_to_proto.at(SubgResult(sg_desc, ptr));
+                              : [&]() -> RPtr& {
+                                    auto& call_to_proto = all_functions.at(sg_desc._funcall).result_call_to_proto;
+                                    auto it = call_to_proto.find(SubgResult(sg_desc, ptr));
+                                    if (it == call_to_proto.end()) {
+                                        OPENVINO_THROW("Couldn't resolve subgraph result to prototype mapping");
+                                    }
+                                    return it->second;
+                                }();
             auto result_iter = std::find(results.begin(), results.end(), proto);
             NPUW_ASSERT(result_iter != results.end());
             return std::distance(results.begin(), result_iter);
@@ -2634,46 +2845,57 @@ ov::npuw::Partitioning ov::npuw::getPartitioning(const std::shared_ptr<ov::Model
 
     if (!ens.repeated.empty()) {
         if (cfg.get<::intel_npu::NPUW_FOLD>()) {
-            // Do full-featured folding
-            auto all_functions = p.initFunctionPipeline(Partitioner::FunctionPipelineType::FOLD);
+            try {
+                // Do full-featured folding
+                auto all_functions = p.initFunctionPipeline(Partitioner::FunctionPipelineType::FOLD);
 
-            // Pass 1: Register all functions and apply general transformations
-            // - matchRepeatedSubgraphs() populates P.functions with all function definitions
-            // - Other transformations (spatial, attention, optimize, etc.) can be applied
-            //   independently without cross-function dependencies
-            for (auto&& func_group : all_functions) {
-                LOG_INFO("FOLD Pass 1: Register and transform function " << func_group << "...");
-                LOG_BLOCK();
-                p.propagateSlices(func_group);
-                p.propagateConverts(func_group);
-                p.propagateWeights(func_group);
-                p.propagateScalars(func_group);
-                p.propagateConvertsOut(func_group);
-                p.sanityCheck(func_group);
-                p.saveRepeatedConstants(func_group);
-                p.saveTailDictConstants(func_group);
-                p.matchParameters(func_group);
-                p.matchResults(func_group);
-                p.matchRepeatedSubgraphs(func_group);  // This populates P.functions
-                p.spatial(func_group);
-                p.attention(func_group);
-                p.optimize(func_group);
-                p.decompressionCutOff(func_group);
-            }
+                // Pass 1: Register all functions and apply general transformations
+                // - matchRepeatedSubgraphs() populates P.functions with all function definitions
+                // - Other transformations (spatial, attention, optimize, etc.) can be applied
+                //   independently without cross-function dependencies
+                for (auto&& func_group : all_functions) {
+                    LOG_INFO("FOLD Pass 1: Register and transform function " << func_group << "...");
+                    LOG_BLOCK();
+                    p.propagateSlices(func_group);
+                    p.propagateConverts(func_group);
+                    p.propagateWeights(func_group);
+                    p.propagateScalars(func_group);
+                    p.propagateConvertsOut(func_group);
+                    p.sanityCheck(func_group);
+                    p.saveRepeatedConstants(func_group);
+                    p.saveTailDictConstants(func_group);
+                    p.matchParameters(func_group);
+                    p.matchResults(func_group);
+                    p.matchRepeatedSubgraphs(func_group);  // This populates P.functions
+                    p.spatial(func_group);
+                    p.attention(func_group);
+                    p.optimize(func_group);
+                    p.decompressionCutOff(func_group);
+                }
 
-            // Pass 2: MoE-specific transformations (requires all functions registered)
-            //
-            // Why separate pass?
-            // - transformMoeExperts() and transformMoeDownstream() require the "router" function
-            // - Router function must be found in P.functions (populated in Pass 1)
-            // - Processing order in Pass 1 is not guaranteed (router may come after experts)
-            // - Therefore, MoE transformations run in Pass 2 after all function registration
-            //   completes, ensuring router model is always available when needed
-            for (auto&& func_group : all_functions) {
-                LOG_INFO("FOLD Pass 2: MoE-specific transformations for " << func_group << "...");
-                LOG_BLOCK();
-                p.transformMoeExperts(func_group);
-                p.transformMoeDownstream(func_group);
+                // Pass 2: MoE-specific transformations (requires all functions registered)
+                //
+                // Why separate pass?
+                // - transformMoeExperts() and transformMoeDownstream() require the "router" function
+                // - Router function must be found in P.functions (populated in Pass 1)
+                // - Processing order in Pass 1 is not guaranteed (router may come after experts)
+                // - Therefore, MoE transformations run in Pass 2 after all function registration
+                //   completes, ensuring router model is always available when needed
+                for (auto&& func_group : all_functions) {
+                    LOG_INFO("FOLD Pass 2: MoE-specific transformations for " << func_group << "...");
+                    LOG_BLOCK();
+                    p.transformMoeExperts(func_group);
+                    p.transformMoeDownstream(func_group);
+                }
+            } catch (const std::exception& ex) {
+                if (cfg.get<::intel_npu::NPUW_CWAI>()) {
+                    throw;
+                }
+
+                LOG_WARN("FOLD partitioning failed for model " << model->get_friendly_name() << ": " << ex.what());
+                LOG_WARN("Retrying partitioning with NPUW_CWAI=YES and NPUW_FOLD=NO");
+                cfg.update({{"NPUW_FOLD", "NO"}, {"NPUW_CWAI", "YES"}});
+                return ov::npuw::getPartitioning(model, cfg, ctx);
             }
         } else if (cfg.get<::intel_npu::NPUW_CWAI>()) {
             // Less brutal version - just transform repeated blocks

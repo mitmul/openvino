@@ -271,7 +271,13 @@ void Group::fuseWith(const Group::GPtr& gptr_cons) {
     auto locked_snapshot = m_snapshot.lock();
     auto node_to_gr = locked_snapshot->getNodeToGroupMap();
     for (const auto& layer : gptr_cons->m_content) {
-        node_to_gr->at(layer) = shared_from_this();  // layers of consumer group are assigned to this group
+        auto it = node_to_gr->find(layer);
+        if (it == node_to_gr->end()) {
+            LOG_WARN("Skipping reassignment for unregistered node " << layer->get_friendly_name()
+                                                                    << " during group fuseWith()");
+            continue;
+        }
+        it->second = shared_from_this();  // layers of consumer group are assigned to this group
     }
 
     // Merge 2 contents together
@@ -296,7 +302,13 @@ void Group::fuseInputs(const std::pair<Group::GPtr, Group::GPtr>& gptr_inputs) {
 
     // Update ov::node to own::ade::NodeHandle map and merge all contents together
     for (const auto& layer : absorbed_group->m_content) {
-        node_to_gr->at(layer) = absorbing_group;
+        auto it = node_to_gr->find(layer);
+        if (it == node_to_gr->end()) {
+            LOG_WARN("Skipping reassignment for unregistered node " << layer->get_friendly_name()
+                                                                    << " during group fuseInputs()");
+            continue;
+        }
+        it->second = absorbing_group;
         absorbing_group->m_content.insert(layer);
     }
     absorbing_group->takeFlags(absorbed_group);

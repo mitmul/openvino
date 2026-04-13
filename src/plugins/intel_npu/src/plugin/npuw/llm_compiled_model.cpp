@@ -41,7 +41,44 @@
 #include "util.hpp"
 #include "whisper_infer_request.hpp"
 
+#include <unordered_set>
+
 namespace opp = ov::pass::pattern;
+
+namespace {
+void ensure_all_parameter_nodes_are_registered(const std::shared_ptr<ov::Model>& model) {
+    std::unordered_set<const ov::Node*> registered_params;
+    for (const auto& param : model->get_parameters()) {
+        registered_params.insert(param.get());
+    }
+
+    ov::ParameterVector missing_params;
+    for (const auto& node : model->get_ordered_ops()) {
+        auto param = ov::as_type_ptr<ov::op::v0::Parameter>(node);
+        if (!param || registered_params.count(param.get()) != 0) {
+            continue;
+        }
+
+        missing_params.push_back(param);
+        registered_params.insert(param.get());
+    }
+
+    if (!missing_params.empty()) {
+        LOG_WARN("Registering " << missing_params.size() << " undeclared Parameter node(s) for model "
+                                << model->get_friendly_name());
+        model->add_parameters(missing_params);
+    }
+}
+
+void ensure_and_validate_model_or_throw(const std::shared_ptr<ov::Model>& model, const char* stage) {
+    ensure_all_parameter_nodes_are_registered(model);
+    try {
+        model->validate_nodes_and_infer_types();
+    } catch (const std::exception& ex) {
+        OPENVINO_THROW("LLMCompiledModel validation failed after ", stage, ": ", ex.what());
+    }
+}
+}  // namespace
 
 // specific function that match subgraph appeared as result of lpt transformations
 auto match_down_up_convert_subgraph_after_lpt = [](const ov::Output<ov::Node>& input) {
@@ -905,7 +942,15 @@ bool remove_empty_kv_inputs(std::shared_ptr<ov::Model> model) {
     rewr.add_matcher<RemoveEmptyKVTensors>(std::ref(ctx));
     rewr.run_on_model(model);
     for (auto old_param : ctx.old_params) {
-        model->remove_parameter(old_param);
+        if (old_param->output(0).get_target_inputs().empty()) {
+            model->remove_parameter(old_param);
+            continue;
+        }
+
+        LOG_WARN("Skip removing KV input parameter '" << old_param->get_friendly_name()
+                                                      << "' because it still has "
+                                                      << old_param->output(0).get_target_inputs().size()
+                                                      << " live users after RemoveEmptyKVTensors.");
     }
     ov::pass::Validate().run_on_model(model);
     // NB: if old_params is not empty - pass has been applied
@@ -1591,6 +1636,7 @@ std::vector<std::shared_ptr<ov::Model>> ov::npuw::LLMCompiledModel::create_gener
 
         // Set unique name for this variant
         generate_variant->set_friendly_name(generate_model->get_friendly_name() + "_kv" + std::to_string(kv_size));
+        ensure_and_validate_model_or_throw(generate_variant, "create_generate_model_variants");
         generate_model_variants.push_back(generate_variant);
     }
     LOG_INFO("Created all generate model variants");
@@ -1613,6 +1659,7 @@ void ov::npuw::LLMCompiledModel::compile_generate_model_variants(
 
         // Use the already prepared variant model
         auto& generate_variant = generate_model_variants[i];
+        ensure_and_validate_model_or_throw(generate_variant, "compile_generate_model_variants");
 
         // Compile the variant
         auto compiled_variant = std::dynamic_pointer_cast<ov::npuw::CompiledModel>(
@@ -1783,6 +1830,10 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     const uint32_t seq_len_dim = m_cfg.get<::intel_npu::NPUW_LLM_SEQ_LEN_DIM>();
     KVAxesPosition axes{batch_dim, seq_len_dim};
 
+    const auto validate_model_or_throw = [](const std::shared_ptr<ov::Model>& model, const char* stage) {
+        ensure_and_validate_model_or_throw(model, stage);
+    };
+
     LOG_DEBUG("Creating kvcache model as clone of passed one.");
     auto kvcache_model = model->clone();
 
@@ -1796,8 +1847,10 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         LOG_DEBUG("Transform kvcache model from stateful to stateless.");
         ov::pass::StatefulToStateless().run_on_model(kvcache_model);
     }
+    validate_model_or_throw(kvcache_model, "StatefulToStateless");
 
     convert_stateful_lora_to_stateless(kvcache_model);
+    validate_model_or_throw(kvcache_model, "convert_stateful_lora_to_stateless");
 
     LOG_DEBUG("   ...also convert BF16 to FP16");
     // Note: we need to identify original bf16 constants for potential weightless deserialization later
@@ -1934,24 +1987,29 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     if (!m_is_embedding) {
         if (!m_use_chunk_prefill) {
             NPUW_ASSERT(remove_empty_kv_inputs(prefill_model));
+            validate_model_or_throw(prefill_model, "remove_empty_kv_inputs");
         } else {
             LOG_DEBUG("Don't remove input key/values from prefill model.");
             LOG_DEBUG("Ask prefill model to output key/values for prefill chunk size tokens.");
             prefill_model = redirect_new_kv_to_output(prefill_model);
+            validate_model_or_throw(prefill_model, "redirect_new_kv_to_output(prefill)");
         }
 
         LOG_DEBUG("Optimize generate model to output key/values for new token.");
         for (size_t i = 0; i < generate_model_variants.size(); ++i) {
             generate_model_variants[i] = redirect_new_kv_to_output(generate_model_variants[i]);
+            validate_model_or_throw(generate_model_variants[i], "redirect_new_kv_to_output(generate)");
         }
     }
 
     LOG_DEBUG("Converting KV-cache in generate model to FP16.");
     for (size_t i = 0; i < generate_model_variants.size(); ++i) {
         generate_model_variants[i] = cvt_kvcache_to_low_precision(generate_model_variants[i], kv_kache_storage_type);
+        validate_model_or_throw(generate_model_variants[i], "cvt_kvcache_to_low_precision(generate)");
     }
     LOG_DEBUG("Converting KV-cache in prefill model to FP16.");
     prefill_model = cvt_kvcache_to_low_precision(prefill_model, kv_kache_storage_type);
+    validate_model_or_throw(prefill_model, "cvt_kvcache_to_low_precision(prefill)");
 
     auto prefill_config =
         prefill_config_opt.value_or(get_default_prefill_config(prefill_model, npudesc)).as<ov::AnyMap>();
@@ -2095,9 +2153,15 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         rewr2.run_on_model(prefill_model);
     }
 
+    for (auto& model_variant : generate_model_variants) {
+        ensure_and_validate_model_or_throw(model_variant, "regularize_generate_model_variants");
+    }
+    ensure_and_validate_model_or_throw(prefill_model, "regularize_prefill_model");
+
     // Compile multiple generate model variants with different sizes
     compile_generate_model_variants(generate_model_variants, plugin, generate_config);
 
+    ensure_and_validate_model_or_throw(prefill_model, "before_prefill_create");
     m_prefill_compiled = std::dynamic_pointer_cast<ov::npuw::CompiledModel>(
         ov::npuw::ICompiledModel::create(prefill_model, plugin, prefill_config));
     NPUW_ASSERT(m_prefill_compiled && "Can't create ov::npuw::CompiledModel for passed prefill "
@@ -2110,6 +2174,7 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
 
         apply_weights_bank_name(lm_head_config, weights_bank_name);
 
+        ensure_and_validate_model_or_throw(lm_head_model, "before_lm_head_create");
         m_lm_head_compiled = std::dynamic_pointer_cast<ov::npuw::CompiledModel>(
             ov::npuw::ICompiledModel::create(lm_head_model, plugin, lm_head_config));
         NPUW_ASSERT(m_lm_head_compiled);

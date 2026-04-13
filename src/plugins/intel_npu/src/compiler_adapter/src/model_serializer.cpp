@@ -9,6 +9,7 @@
 #include <istream>
 #include <regex>
 #include <streambuf>
+#include <unordered_set>
 
 #include "custom_stream_buffer.hpp"
 #include "intel_npu/common/filtered_config.hpp"
@@ -24,6 +25,29 @@
 #include "xml_serializer.hpp"
 
 namespace {
+
+void ensure_all_parameter_nodes_are_registered(const std::shared_ptr<ov::Model>& model) {
+    std::unordered_set<const ov::Node*> registered_params;
+    for (const auto& param : model->get_parameters()) {
+        registered_params.insert(param.get());
+    }
+
+    ov::ParameterVector missing_params;
+    for (const auto& node : model->get_ordered_ops()) {
+        auto param = ov::as_type_ptr<ov::op::v0::Parameter>(node);
+        if (!param || registered_params.count(param.get()) != 0) {
+            continue;
+        }
+
+        missing_params.push_back(param);
+        registered_params.insert(param.get());
+    }
+
+    if (!missing_params.empty()) {
+        model->add_parameters(missing_params);
+        model->validate_nodes_and_infer_types();
+    }
+}
 
 constexpr std::string_view INPUTS_PRECISIONS_KEY = "--inputs_precisions";
 constexpr std::string_view INPUTS_LAYOUTS_KEY = "--inputs_layouts";
@@ -581,6 +605,7 @@ SerializedIR serializeIR(
 
     // The current instance is already a clone (or should be one), we are not modifying the original model
     const std::shared_ptr<ov::Model> nonConstantModel = std::const_pointer_cast<ov::Model>(model);
+    ensure_all_parameter_nodes_are_registered(nonConstantModel);
     const ov::intel_npu::ModelSerializerVersion version =
         determineModelSerializerVersion(serializerVersion, isOptionValueSupportedByCompiler, nonConstantModel, logger);
 

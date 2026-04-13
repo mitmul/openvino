@@ -260,7 +260,13 @@ void Snapshot::buildGraph() {
                 if (!isOp(ov_node_child)) {
                     continue;
                 }
-                const Group::GPtr& gr_child = _(m_node_to_gr).at(ov_node_child);
+                auto child_group_it = m_node_to_gr->find(ov_node_child);
+                if (child_group_it == m_node_to_gr->end()) {
+                    LOG_WARN("Skipping link to unregistered child node " << ov_node_child->get_friendly_name()
+                                                                        << " while building online partitioning graph");
+                    continue;
+                }
+                const Group::GPtr& gr_child = child_group_it->second;
                 if (!m_graph->linked(nh, gr_child->getHandle())) {
                     m_graph->link(nh, gr_child->getHandle());
                 }
@@ -281,7 +287,13 @@ void Snapshot::buildGraph() {
                 continue;
             }
 
-            const Group::GPtr& gr_parent = _(m_node_to_gr).at(ov_node_parent);
+            auto parent_group_it = m_node_to_gr->find(ov_node_parent);
+            if (parent_group_it == m_node_to_gr->end()) {
+                LOG_WARN("Skipping link from unregistered parent node " << ov_node_parent->get_friendly_name()
+                                                                        << " while building online partitioning graph");
+                continue;
+            }
+            const Group::GPtr& gr_parent = parent_group_it->second;
             if (!m_graph->linked(gr_parent->getHandle(), nh)) {
                 m_graph->link(gr_parent->getHandle(), nh);
             }

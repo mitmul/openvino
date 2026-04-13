@@ -841,9 +841,23 @@ void ov::npuw::LLMInferRequest::infer_prefill(ov::SoPtr<ov::ITensor> input_ids,
     if (m_lm_head_request) {
         LOG_DEBUG("Calling inference for LM head model.");
         m_lm_head_request->infer();
-        m_logits = m_lm_head_request->get_tensor(m_lm_head_logits_port);
+        auto padded_logits = m_lm_head_request->get_tensor(m_lm_head_logits_port);
+        auto logits_seq_len = static_cast<uint32_t>(padded_logits->get_shape()[1]);
+        auto useful_seq_len = std::min(kvcache_desc.num_stored_tokens, logits_seq_len);
+        m_logits = ov::npuw::util::make_tensor_slice(
+            padded_logits,
+            1u,
+            logits_seq_len - useful_seq_len,
+            logits_seq_len);
     } else {
-        m_logits = m_prefill_request->get_tensor(m_prefill_out_ports.at(layer_names::logits));
+        auto padded_logits = m_prefill_request->get_tensor(m_prefill_out_ports.at(layer_names::logits));
+        auto logits_seq_len = static_cast<uint32_t>(padded_logits->get_shape()[1]);
+        auto useful_seq_len = std::min(kvcache_desc.num_stored_tokens, logits_seq_len);
+        m_logits = ov::npuw::util::make_tensor_slice(
+            padded_logits,
+            1u,
+            logits_seq_len - useful_seq_len,
+            logits_seq_len);
     }
 
     // Update last_hidden_state only for non-chunked prefill
