@@ -570,6 +570,26 @@ void ov::npuw::LLMInferRequest::copy_kvcache() {
 
             uu::copy_tensor_by_dim(prefill_present_kv_chunk, kvcache_last_kv_chunk, pre_kv_dim, gen_kv_dim);
         } else {
+            // Skip this output if the prefill tensor's seq dimension is
+            // smaller than the expected slice range.  This happens for
+            // non-standard state tensors (e.g. Mamba emulated cache) whose
+            // present output does not grow with the prompt length.
+            const auto prefill_seq_len =
+                static_cast<uint32_t>(prefill_out_tensor->get_shape()[pre_kv_dim]);
+            if (prefill_seq_len < kvcache_desc.num_stored_tokens) {
+                LOG_DEBUG("Prefill output " << output_name << " has seq_len=" << prefill_seq_len
+                                            << " < num_stored_tokens=" << kvcache_desc.num_stored_tokens
+                                            << ". Copying available data only.");
+                if (prefill_seq_len > 0) {
+                    auto prefill_out_slice =
+                        uu::make_tensor_slice(prefill_out_tensor, pre_kv_dim, 0u, prefill_seq_len);
+                    auto kvcache_in_slice =
+                        uu::make_tensor_slice(kvcache_in_tensor, gen_kv_dim, 0u, prefill_seq_len);
+                    uu::copy_tensor_by_dim(prefill_out_slice, kvcache_in_slice, pre_kv_dim, gen_kv_dim);
+                }
+                return;
+            }
+
             auto prefill_out_slice =
                 uu::make_tensor_slice(prefill_out_tensor,
                                       pre_kv_dim,

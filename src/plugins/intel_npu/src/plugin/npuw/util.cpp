@@ -202,7 +202,14 @@ void ov::npuw::util::unpack(const ov::SoPtr<ov::ITensor>& from,
         HNDL(u4, f32);
         HNDL(i8, f16);
     default:
-        OPENVINO_THROW("Unknown unpack combination ", type_from, " -> ", type_to);
+        OPENVINO_THROW("Unknown unpack combination ",
+                       type_from,
+                       " -> ",
+                       type_to,
+                       ", from_shape=",
+                       from->get_shape(),
+                       ", to_shape=",
+                       to->get_shape());
     }
 #undef HNDL
 #undef PAIR
@@ -243,7 +250,18 @@ void ov::npuw::util::unpack(const ov::SoPtr<ov::ITensor>& from,
         // FIXME: Implement XARCH::unpack
         unpack_f16f16(from, scale, to, unpack_options);
     } else {
-        NPUW_ASSERT(false && "Unsupported combination");
+        OPENVINO_THROW("Unsupported unpack(from, scale, to) combination: from=",
+                       type_from,
+                       " scale=",
+                       scale->get_element_type(),
+                       " to=",
+                       type_to,
+                       ", from_shape=",
+                       from_shape,
+                       ", scale_shape=",
+                       scale_shape,
+                       ", to_shape=",
+                       to->get_shape());
     }
 }
 
@@ -266,7 +284,22 @@ void ov::npuw::util::unpack(const ov::SoPtr<ov::ITensor>& from,
         NPUW_ASSERT(type_scale == ov::element::f16);
         NPUW_ASSERT(type_to == ov::element::f16);
     } else {
-        NPUW_ASSERT(false && "Unsupported combination");
+        OPENVINO_THROW("Unsupported unpack(from, zerop, scale, to) combination: from=",
+                       type_from,
+                       " zerop=",
+                       type_zerop,
+                       " scale=",
+                       type_scale,
+                       " to=",
+                       type_to,
+                       ", from_shape=",
+                       from->get_shape(),
+                       ", zerop_shape=",
+                       zerop->get_shape(),
+                       ", scale_shape=",
+                       scale->get_shape(),
+                       ", to_shape=",
+                       to->get_shape());
     }
 
     // This function determines the appropriate unpacking strategy for tensor multiplication

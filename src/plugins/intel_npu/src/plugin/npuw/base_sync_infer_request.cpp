@@ -484,17 +484,33 @@ void ov::npuw::IBaseInferRequest::unpack_closure(std::size_t idx, RqPtr request)
         auto clparam = request->get_tensor(iport);
 
         if (!comp_model_desc.scales.empty() && comp_model_desc.scales[cidx] && comp_model_desc.zerops[cidx]) {
+            LOG_WARN("NPUW unpack_closure (asymm) idx=" << idx << " real_idx=" << real_idx << " cidx=" << cidx
+                                                        << " port=" << iport.get_any_name() << " closure_type="
+                                                        << closure.get_element_type() << " zerop_type="
+                                                        << comp_model_desc.zerops[cidx].get_element_type()
+                                                        << " scale_type="
+                                                        << comp_model_desc.scales[cidx].get_element_type()
+                                                        << " target_type=" << clparam->get_element_type());
             // Unpacking this weight requires scaling with zero points...
             ov::npuw::util::unpack(ov::get_tensor_impl(closure),
                                    ov::get_tensor_impl(comp_model_desc.zerops[cidx]),
                                    ov::get_tensor_impl(comp_model_desc.scales[cidx]),
                                    clparam);
         } else if (!comp_model_desc.scales.empty() && comp_model_desc.scales[cidx]) {
+            LOG_WARN("NPUW unpack_closure (symm) idx=" << idx << " real_idx=" << real_idx << " cidx=" << cidx
+                                                       << " port=" << iport.get_any_name() << " closure_type="
+                                                       << closure.get_element_type() << " scale_type="
+                                                       << comp_model_desc.scales[cidx].get_element_type()
+                                                       << " target_type=" << clparam->get_element_type());
             // Unpacking this weight requires scaling
             ov::npuw::util::unpack(ov::get_tensor_impl(closure),
                                    ov::get_tensor_impl(comp_model_desc.scales[cidx]),
                                    clparam);
         } else {
+            LOG_WARN("NPUW unpack_closure (plain) idx=" << idx << " real_idx=" << real_idx << " cidx=" << cidx
+                                                        << " port=" << iport.get_any_name() << " closure_type="
+                                                        << closure.get_element_type() << " target_type="
+                                                        << clparam->get_element_type());
             // Unpacking this weight doesn't require scaling
             ov::npuw::util::unpack(ov::get_tensor_impl(closure), clparam);
         }
@@ -718,6 +734,18 @@ void ov::npuw::IBaseInferRequest::handle_quant_host_gather(std::size_t idx, RqPt
             ov::npuw::util::gather(vocabz, lookup, ov::get_tensor_impl(m_quant_gather_tensors.z));
             ov::npuw::util::gather(vocabs, lookup, ov::get_tensor_impl(m_quant_gather_tensors.s));
 
+            LOG_WARN("NPUW quant host gather (asymm) idx=" << idx << " ids=" << lport.get_any_name() << " dst="
+                                                           << gport.get_any_name() << " w=" << wport.get_any_name()
+                                                           << "(" << vocabw->get_element_type() << " -> "
+                                                           << m_quant_gather_tensors.w.get_element_type() << ")"
+                                                           << " z=" << zport.get_any_name() << "("
+                                                           << vocabz->get_element_type() << " -> "
+                                                           << m_quant_gather_tensors.z.get_element_type() << ")"
+                                                           << " s=" << sport.get_any_name() << "("
+                                                           << vocabs->get_element_type() << " -> "
+                                                           << m_quant_gather_tensors.s.get_element_type() << ")"
+                                                           << " gather_type=" << gather->get_element_type());
+
             // Then unpack
             ov::npuw::util::unpack(ov::get_tensor_impl(m_quant_gather_tensors.w),
                                    ov::get_tensor_impl(m_quant_gather_tensors.z),
@@ -729,6 +757,15 @@ void ov::npuw::IBaseInferRequest::handle_quant_host_gather(std::size_t idx, RqPt
 
             // Gather first
             ov::npuw::util::gather(vocabs, lookup, ov::get_tensor_impl(m_quant_gather_tensors.s));
+
+            LOG_WARN("NPUW quant host gather (symm) idx=" << idx << " ids=" << lport.get_any_name() << " dst="
+                                                          << gport.get_any_name() << " w=" << wport.get_any_name()
+                                                          << "(" << vocabw->get_element_type() << " -> "
+                                                          << m_quant_gather_tensors.w.get_element_type() << ")"
+                                                          << " s=" << sport.get_any_name() << "("
+                                                          << vocabs->get_element_type() << " -> "
+                                                          << m_quant_gather_tensors.s.get_element_type() << ")"
+                                                          << " gather_type=" << gather->get_element_type());
 
             // Then unpack
             ov::npuw::util::unpack(ov::get_tensor_impl(m_quant_gather_tensors.w),

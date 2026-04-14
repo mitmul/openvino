@@ -107,11 +107,37 @@ ZeroInferRequest::ZeroInferRequest(const std::shared_ptr<ZeroInitStructsHolder>&
             // Only one buffer is required for each (state input, state output) pair, acting as an input before running
             // the inference and as an output after performing it. Thus both the "state input" and "state output"
             // entries shall point to the same buffer.
-            OPENVINO_ASSERT(outputDescriptor.relatedDescriptorIndex.has_value(),
-                            "The link between state descriptors is missing, state name: ",
-                            outputDescriptor.nameFromCompiler);
-            _levelZeroOutputTensors.at(ioIndex) = get_level_zero_input(*outputDescriptor.relatedDescriptorIndex);
-            _userOutputTensors.at(ioIndex) = _levelZeroOutputTensors.at(ioIndex);
+            if (outputDescriptor.relatedDescriptorIndex.has_value()) {
+                _levelZeroOutputTensors.at(ioIndex) = get_level_zero_input(*outputDescriptor.relatedDescriptorIndex);
+                _userOutputTensors.at(ioIndex) = _levelZeroOutputTensors.at(ioIndex);
+            } else {
+                // Unpaired state output (bindRelatedDescriptors could not
+                // find the matching input).  Search the input descriptors
+                // by name to share the same buffer so the state persists
+                // between infer() calls (Assign writes → next ReadValue
+                // reads from the same memory).
+                bool found = false;
+                size_t inputScanIndex = 0;
+                for (const IODescriptor& inputDesc : _metadata.inputs) {
+                    if (inputDesc.isStateInput &&
+                        inputDesc.nameFromCompiler == outputDescriptor.nameFromCompiler) {
+                        _levelZeroOutputTensors.at(ioIndex) = get_level_zero_input(inputScanIndex);
+                        _userOutputTensors.at(ioIndex) = _levelZeroOutputTensors.at(ioIndex);
+                        _logger.warning("ZeroInferRequest - linked unpaired state output to input by name, "
+                                        "state name: %s",
+                                        outputDescriptor.nameFromCompiler.c_str());
+                        found = true;
+                        break;
+                    }
+                    ++inputScanIndex;
+                }
+                if (!found) {
+                    _logger.warning("ZeroInferRequest - truly unpaired state output, "
+                                    "allocating separate buffer, state name: %s",
+                                    outputDescriptor.nameFromCompiler.c_str());
+                    _levelZeroOutputTensors.at(ioIndex) = allocate_tensor(ioIndex, OUTPUT);
+                }
+            }
 
             ++ioIndex;
             continue;
@@ -993,9 +1019,18 @@ std::vector<ov::ProfilingInfo> ZeroInferRequest::get_profiling_info() const {
 }
 
 void ZeroInferRequest::add_state(const IODescriptor& descriptor, size_t tensorIndex) const {
-    OPENVINO_ASSERT(descriptor.relatedDescriptorIndex.has_value(),
-                    "The link between state descriptors is missing, state name: ",
-                    descriptor.nameFromCompiler);
+    if (!descriptor.relatedDescriptorIndex.has_value()) {
+        // Unpaired state input (no matching state output).  This happens when
+        // internal ReadValue/Assign nodes coexist with externally-managed
+        // (StatefulToStateless-converted) states -- e.g. Mamba recurrent
+        // state alongside attention KV cache managed by NPUW.  The NPU
+        // firmware keeps the state loop internally; we just skip creating a
+        // user-visible ZeroVariableState for it.
+        _logger.warning("add_state - skipping unpaired state input (no matching state output), "
+                        "state name: %s",
+                        descriptor.nameFromCompiler.c_str());
+        return;
+    }
 
     _variableStates.push_back(std::make_shared<ZeroVariableState>(_initStructs,
                                                                   descriptor.nameFromCompiler,
