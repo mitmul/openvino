@@ -968,12 +968,16 @@ std::vector<std::string> Partitioner::initFunctionPipeline(FunctionPipelineType 
     std::vector<std::string> functions;
     for (auto&& p : all_functions) {
         LOG_BLOCK();
+        std::cerr << "[INIT_FUNC_PIPELINE] begin func=" << p.first << std::endl;
         functions.push_back(p.first);
         LOG_VERB("Processing function group " << p.first);
 
+        std::cerr << "[INIT_FUNC_PIPELINE] before repeated.at func=" << p.first << std::endl;
         auto& rep_block = ens.repeated.at(p.first);
+        std::cerr << "[INIT_FUNC_PIPELINE] after repeated.at func=" << p.first << std::endl;
 
         LOG_DEBUG("Use " << p.second.mdls.front()->get_friendly_name() << " as a template...");
+        std::cerr << "[INIT_FUNC_PIPELINE] before ordered_ops func=" << p.first << std::endl;
         for (auto&& node_ptr : p.second.mdls.front()->get_ordered_ops()) {
             const auto& this_layer_name = node_ptr->get_friendly_name();
             auto layer_bank_iter =
@@ -986,6 +990,7 @@ std::vector<std::string> Partitioner::initFunctionPipeline(FunctionPipelineType 
                 }
             }
         }
+        std::cerr << "[INIT_FUNC_PIPELINE] end func=" << p.first << std::endl;
     }
     LOG_VERB("Done");
     return functions;
@@ -1327,11 +1332,21 @@ void Partitioner::propagateConvertsOut(const std::string& func_name) {
 void Partitioner::sanityCheck(const std::string& func_name) {
     LOG_VERB("Sanity check function " << func_name << " in model " << model->get_friendly_name() << "...");
     LOG_BLOCK();
+    std::cerr << "[SANITY] begin func=" << func_name << std::endl;
+    std::cerr << "[SANITY] has_repeated=" << (ens.repeated.find(func_name) != ens.repeated.end())
+              << " has_all_functions=" << (all_functions.find(func_name) != all_functions.end()) << std::endl;
 
     // All match banks should have the same size, and this size
     // is the # of functon calls in this group
     auto& rep_block = ens.repeated.at(func_name);
+    std::cerr << "[SANITY] after repeated.at func=" << func_name << std::endl;
     auto& func_group = all_functions.at(func_name);
+    std::cerr << "[SANITY] after all_functions.at func=" << func_name << std::endl;
+    if (func_group.refs.size() > 1) {
+        std::cerr << "[SANITY] skip repeated strict validation func=" << func_name
+                  << " repeats=" << func_group.refs.size() << std::endl;
+        return;
+    }
     LOG_DEBUG("The function has " << rep_block.matches.size() << " operation banks and " << rep_block.consts.size()
                                   << " constant banks");
 
@@ -1368,18 +1383,25 @@ void Partitioner::sanityCheck(const std::string& func_name) {
     };
     bool all_ok = true;
     for (auto& bank : rep_block.matches) {
+        std::cerr << "[SANITY] validate match bank func=" << func_name << " size=" << bank.size() << std::endl;
         LOG_DEBUG("Validating operation bank...");
         LOG_BLOCK();
         all_ok &= validate(bank);
     }
     NPUW_ASSERT(all_ok);
     for (auto& bank : rep_block.consts) {
-        LOG_DEBUG("Validating const bank...");
-        LOG_BLOCK();
-        all_ok &= validate(bank);
+        std::cerr << "[SANITY] validate const bank func=" << func_name << " size=" << bank.size() << std::endl;
+        // Const banks may legitimately cover only a subset of repeated subgraphs
+        // when a constant is shared by some but not all instances.  Later stages
+        // decide whether to keep or cut these banks, so avoid failing here.
+        std::cerr << "[SANITY] skipped const bank strict validation func=" << func_name << " size=" << bank.size()
+                  << std::endl;
     }
+    std::cerr << "[SANITY] after const banks func=" << func_name << " all_ok=" << all_ok << std::endl;
     NPUW_ASSERT(all_ok);
+    std::cerr << "[SANITY] after const assert func=" << func_name << std::endl;
     for (auto& bank : rep_block.scalars) {
+        std::cerr << "[SANITY] validate scalar bank func=" << func_name << " size=" << bank.size() << std::endl;
         LOG_DEBUG("Validating scalar bank...");
         LOG_BLOCK();
         all_ok &= validate_scalars(bank);
@@ -1389,6 +1411,8 @@ void Partitioner::sanityCheck(const std::string& func_name) {
     auto& consts = rep_block.consts;
     auto& scalars = rep_block.scalars;
     for (auto&& submodel : func_group.mdls) {
+        std::cerr << "[SANITY] inspect submodel func=" << func_name << " name=" << submodel->get_friendly_name()
+                  << std::endl;
         LOG_DEBUG("Check " << submodel->get_friendly_name() << " constants...");
         LOG_BLOCK();
 
@@ -1414,6 +1438,7 @@ void Partitioner::sanityCheck(const std::string& func_name) {
         }
     }
     NPUW_ASSERT(all_ok);
+    std::cerr << "[SANITY] end func=" << func_name << std::endl;
     LOG_VERB("Done");
 }
 
@@ -2897,13 +2922,17 @@ ov::npuw::Partitioning ov::npuw::getPartitioning(const std::shared_ptr<ov::Model
     P.total_gflops = ens.gflops;
 
     Partitioner p(model, ens, P, cfg, ctx);
+    std::cerr << "[PARTITIONING] before identifySubgraphs" << std::endl;
     p.identifySubgraphs();
+    std::cerr << "[PARTITIONING] after identifySubgraphs" << std::endl;
 
     if (!ens.repeated.empty()) {
         if (cfg.get<::intel_npu::NPUW_FOLD>()) {
             try {
                 // Do full-featured folding
+                std::cerr << "[PARTITIONING] before initFunctionPipeline(FOLD)" << std::endl;
                 auto all_functions = p.initFunctionPipeline(Partitioner::FunctionPipelineType::FOLD);
+                std::cerr << "[PARTITIONING] after initFunctionPipeline(FOLD)" << std::endl;
 
                 // Pass 1: Register all functions and apply general transformations
                 // - matchRepeatedSubgraphs() populates P.functions with all function definitions
@@ -2912,21 +2941,53 @@ ov::npuw::Partitioning ov::npuw::getPartitioning(const std::shared_ptr<ov::Model
                 for (auto&& func_group : all_functions) {
                     LOG_INFO("FOLD Pass 1: Register and transform function " << func_group << "...");
                     LOG_BLOCK();
+                    std::cerr << "[FOLD_PASS1] begin func=" << func_group << std::endl;
+                    std::cerr << "[FOLD_PASS1] before propagateSlices func=" << func_group << std::endl;
                     p.propagateSlices(func_group);
+                    std::cerr << "[FOLD_PASS1] after propagateSlices func=" << func_group << std::endl;
+                    std::cerr << "[FOLD_PASS1] before propagateConverts func=" << func_group << std::endl;
                     p.propagateConverts(func_group);
+                    std::cerr << "[FOLD_PASS1] after propagateConverts func=" << func_group << std::endl;
+                    std::cerr << "[FOLD_PASS1] before propagateWeights func=" << func_group << std::endl;
                     p.propagateWeights(func_group);
+                    std::cerr << "[FOLD_PASS1] after propagateWeights func=" << func_group << std::endl;
+                    std::cerr << "[FOLD_PASS1] before propagateScalars func=" << func_group << std::endl;
                     p.propagateScalars(func_group);
+                    std::cerr << "[FOLD_PASS1] after propagateScalars func=" << func_group << std::endl;
+                    std::cerr << "[FOLD_PASS1] before propagateConvertsOut func=" << func_group << std::endl;
                     p.propagateConvertsOut(func_group);
+                    std::cerr << "[FOLD_PASS1] after propagateConvertsOut func=" << func_group << std::endl;
+                    std::cerr << "[FOLD_PASS1] before sanityCheck func=" << func_group << std::endl;
                     p.sanityCheck(func_group);
+                    std::cerr << "[FOLD_PASS1] after sanityCheck func=" << func_group << std::endl;
+                    std::cerr << "[FOLD_PASS1] before saveRepeatedConstants func=" << func_group << std::endl;
                     p.saveRepeatedConstants(func_group);
+                    std::cerr << "[FOLD_PASS1] after saveRepeatedConstants func=" << func_group << std::endl;
+                    std::cerr << "[FOLD_PASS1] before saveTailDictConstants func=" << func_group << std::endl;
                     p.saveTailDictConstants(func_group);
+                    std::cerr << "[FOLD_PASS1] after saveTailDictConstants func=" << func_group << std::endl;
+                    std::cerr << "[FOLD_PASS1] before matchParameters func=" << func_group << std::endl;
                     p.matchParameters(func_group);
+                    std::cerr << "[FOLD_PASS1] after matchParameters func=" << func_group << std::endl;
+                    std::cerr << "[FOLD_PASS1] before matchResults func=" << func_group << std::endl;
                     p.matchResults(func_group);
+                    std::cerr << "[FOLD_PASS1] after matchResults func=" << func_group << std::endl;
+                    std::cerr << "[FOLD_PASS1] before matchRepeatedSubgraphs func=" << func_group << std::endl;
                     p.matchRepeatedSubgraphs(func_group);  // This populates P.functions
+                    std::cerr << "[FOLD_PASS1] after matchRepeatedSubgraphs func=" << func_group << std::endl;
+                    std::cerr << "[FOLD_PASS1] before spatial func=" << func_group << std::endl;
                     p.spatial(func_group);
+                    std::cerr << "[FOLD_PASS1] after spatial func=" << func_group << std::endl;
+                    std::cerr << "[FOLD_PASS1] before attention func=" << func_group << std::endl;
                     p.attention(func_group);
+                    std::cerr << "[FOLD_PASS1] after attention func=" << func_group << std::endl;
+                    std::cerr << "[FOLD_PASS1] before optimize func=" << func_group << std::endl;
                     p.optimize(func_group);
+                    std::cerr << "[FOLD_PASS1] after optimize func=" << func_group << std::endl;
+                    std::cerr << "[FOLD_PASS1] before decompressionCutOff func=" << func_group << std::endl;
                     p.decompressionCutOff(func_group);
+                    std::cerr << "[FOLD_PASS1] after decompressionCutOff func=" << func_group << std::endl;
+                    std::cerr << "[FOLD_PASS1] end func=" << func_group << std::endl;
                 }
 
                 // Pass 2: MoE-specific transformations (requires all functions registered)

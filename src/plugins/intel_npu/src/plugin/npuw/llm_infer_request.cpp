@@ -853,6 +853,10 @@ void ov::npuw::LLMInferRequest::infer_whole_prefill(ov::SoPtr<ov::ITensor> input
                                                     ov::SoPtr<ov::ITensor> token_type_ids) {
     LOG_DEBUG("Calling inference for prefill model in a single launch.");
     LOG_BLOCK();
+    std::cerr << "[LLM_PREFILL_WHOLE] begin"
+              << " input_ids_shape=" << input_ids->get_shape()
+              << " attention_mask_shape=" << attention_mask->get_shape()
+              << " position_ids_shape=" << position_ids->get_shape() << std::endl;
 
     // NB: padded_input can be either fp32(VLM) or i64(LLM)
     auto padded_input = m_prefill_request->get_tensor(m_prefill_in_ports.at(m_input_ids_name));
@@ -862,10 +866,22 @@ void ov::npuw::LLMInferRequest::infer_whole_prefill(ov::SoPtr<ov::ITensor> input
         reinterpret_cast<uint8_t*>(padded_input->data()) + padded_input->get_byte_size() - input_ids->get_byte_size());
 
     auto padded_attention_mask = m_prefill_request->get_tensor(m_prefill_in_ports.at(layer_names::attention_mask));
-    std::copy_n(
-        attention_mask->data<int64_t>(),
-        attention_mask->get_size(),
-        padded_attention_mask->data<int64_t>() + padded_attention_mask->get_size() - attention_mask->get_size());
+    ov::npuw::util::fill_tensor<int64_t>(padded_attention_mask, 0);
+    if (attention_mask->get_size() <= padded_attention_mask->get_size()) {
+        std::copy_n(
+            attention_mask->data<int64_t>(),
+            attention_mask->get_size(),
+            padded_attention_mask->data<int64_t>() + padded_attention_mask->get_size() - attention_mask->get_size());
+    } else {
+        // Top-level static stateful bundles may expose a longer attention mask
+        // (prompt + reserved decode budget) than the prefill model consumes.
+        // For prefill we only need the right-aligned prompt window that matches
+        // the prefill model input shape.
+        std::copy_n(
+            attention_mask->data<int64_t>() + (attention_mask->get_size() - padded_attention_mask->get_size()),
+            padded_attention_mask->get_size(),
+            padded_attention_mask->data<int64_t>());
+    }
 
     if (token_type_ids) {
         auto padded_token_type_ids = m_prefill_request->get_tensor(m_prefill_in_ports.at(layer_names::token_type_ids));
@@ -881,10 +897,13 @@ void ov::npuw::LLMInferRequest::infer_whole_prefill(ov::SoPtr<ov::ITensor> input
         m_eagle3_ext.prepare_inputs(m_prefill_request, m_prefill_in_ports);
     }
 
+    std::cerr << "[LLM_PREFILL_WHOLE] before_prefill_infer" << std::endl;
     m_prefill_request->infer();
+    std::cerr << "[LLM_PREFILL_WHOLE] after_prefill_infer" << std::endl;
     auto& kvcache_desc = m_npuw_llm_compiled_model->m_kvcache_desc;
     kvcache_desc.num_stored_tokens += static_cast<uint32_t>(input_ids->get_shape()[layer_ids::INPUT_IDS_SEQ_LEN_DIM]);
 
+    std::cerr << "[LLM_PREFILL_WHOLE] end num_stored_tokens=" << kvcache_desc.num_stored_tokens << std::endl;
     LOG_DEBUG("Done");
 }
 
@@ -894,6 +913,10 @@ void ov::npuw::LLMInferRequest::infer_prefill(ov::SoPtr<ov::ITensor> input_ids,
                                               ov::SoPtr<ov::ITensor> token_type_ids) {
     LOG_DEBUG("Calling inference for prefill model...");
     LOG_BLOCK();
+    std::cerr << "[LLM_PREFILL] begin"
+              << " input_ids_shape=" << input_ids->get_shape()
+              << " attention_mask_shape=" << attention_mask->get_shape()
+              << " position_ids_shape=" << position_ids->get_shape() << std::endl;
 
     const auto prompt_length = input_ids->get_shape()[layer_ids::INPUT_IDS_SEQ_LEN_DIM];
     auto& kvcache_desc = m_npuw_llm_compiled_model->m_kvcache_desc;
@@ -908,6 +931,8 @@ void ov::npuw::LLMInferRequest::infer_prefill(ov::SoPtr<ov::ITensor> input_ids,
 
     process_longrope(m_prefill_request, m_prefill_in_ports, position_ids);
     const bool use_chunk_prefill = m_npuw_llm_compiled_model->m_use_chunk_prefill;
+    std::cerr << "[LLM_PREFILL] use_chunk_prefill=" << use_chunk_prefill
+              << " prompt_length=" << prompt_length << std::endl;
     if (use_chunk_prefill) {
         OPENVINO_ASSERT(!token_type_ids,
                         "Chunking is not implemented for Gemma model family yet. "
@@ -919,7 +944,9 @@ void ov::npuw::LLMInferRequest::infer_prefill(ov::SoPtr<ov::ITensor> input_ids,
 
     if (m_lm_head_request) {
         LOG_DEBUG("Calling inference for LM head model.");
+        std::cerr << "[LLM_PREFILL] before_lm_head_infer" << std::endl;
         m_lm_head_request->infer();
+        std::cerr << "[LLM_PREFILL] after_lm_head_infer" << std::endl;
         auto padded_logits = m_lm_head_request->get_tensor(m_lm_head_logits_port);
         auto logits_seq_len = static_cast<uint32_t>(padded_logits->get_shape()[1]);
         auto useful_seq_len = std::min(kvcache_desc.num_stored_tokens, logits_seq_len);
@@ -947,6 +974,7 @@ void ov::npuw::LLMInferRequest::infer_prefill(ov::SoPtr<ov::ITensor> input_ids,
 
     m_generate_initialized = false;
 
+    std::cerr << "[LLM_PREFILL] end num_stored_tokens=" << kvcache_desc.num_stored_tokens << std::endl;
     LOG_DEBUG("Done");
 }
 
@@ -956,6 +984,10 @@ void ov::npuw::LLMInferRequest::infer_generate(ov::SoPtr<ov::ITensor> input_ids,
                                                ov::SoPtr<ov::ITensor> token_type_ids) {
     LOG_DEBUG("Calling inference for generate model...");
     LOG_BLOCK();
+    std::cerr << "[LLM_GENERATE] begin"
+              << " input_ids_shape=" << input_ids->get_shape()
+              << " attention_mask_shape=" << attention_mask->get_shape()
+              << " position_ids_shape=" << position_ids->get_shape() << std::endl;
     auto& kvcache_desc = m_npuw_llm_compiled_model->m_kvcache_desc;
     uint32_t input_tokens_len = static_cast<uint32_t>(input_ids->get_shape()[layer_ids::INPUT_IDS_SEQ_LEN_DIM]);
     if (input_tokens_len > kvcache_desc.max_generation_token_len) {
@@ -969,6 +1001,8 @@ void ov::npuw::LLMInferRequest::infer_generate(ov::SoPtr<ov::ITensor> input_ids,
 
     if (!m_generate_initialized) {
         LOG_DEBUG("Copy kv-cache from prefill to generate model.");
+        std::cerr << "[LLM_GENERATE] initializing_generate_request"
+                  << " num_stored_tokens=" << kvcache_desc.num_stored_tokens << std::endl;
         if (kvcache_desc.num_stored_tokens > 0) {
             copy_kvcache();
         }
@@ -1031,11 +1065,14 @@ void ov::npuw::LLMInferRequest::infer_generate(ov::SoPtr<ov::ITensor> input_ids,
         m_eagle3_ext.prepare_inputs(m_kvcache_request, m_kvcache_in_ports);
     }
 
+    std::cerr << "[LLM_GENERATE] before_kvcache_infer" << std::endl;
     m_kvcache_request->infer();
+    std::cerr << "[LLM_GENERATE] after_kvcache_infer" << std::endl;
     kvcache_desc.num_stored_tokens += input_tokens_len;
 
     if (m_lm_head_request) {
         LOG_DEBUG("Calling inference for LM head model asynchronously");
+        std::cerr << "[LLM_GENERATE] before_lm_head_start_async" << std::endl;
         m_lm_head_request->start_async();
         if (kvcache_desc.num_stored_tokens < kvcache_desc.total_size) {
             update_kvcache_for(m_kvcache_request,
@@ -1044,7 +1081,9 @@ void ov::npuw::LLMInferRequest::infer_generate(ov::SoPtr<ov::ITensor> input_ids,
                                input_tokens_len,
                                kvcache_desc.v_tensors_transposed_gen);
         }
+        std::cerr << "[LLM_GENERATE] before_lm_head_wait" << std::endl;
         m_lm_head_request->wait();
+        std::cerr << "[LLM_GENERATE] after_lm_head_wait" << std::endl;
         LOG_DEBUG("Calling inference for LM head model -- done.");
 
         m_logits = m_lm_head_request->get_tensor(m_lm_head_logits_port);
@@ -1064,11 +1103,13 @@ void ov::npuw::LLMInferRequest::infer_generate(ov::SoPtr<ov::ITensor> input_ids,
         m_eagle3_ext.update_last_hidden_state(m_kvcache_request, m_kvcache_out_ports);
     }
 
+    std::cerr << "[LLM_GENERATE] end num_stored_tokens=" << kvcache_desc.num_stored_tokens << std::endl;
     LOG_DEBUG("Done");
 }
 
 void ov::npuw::LLMInferRequest::infer() {
     const auto& inputs = get_inputs();
+    std::cerr << "[LLM_INFER] begin" << std::endl;
 
     auto input_ids = get_tensor(ov::npuw::util::find_port_by_name(inputs, m_input_ids_name).value());
     auto attention_mask = get_tensor(ov::npuw::util::find_port_by_name(inputs, layer_names::attention_mask).value());
@@ -1125,6 +1166,10 @@ void ov::npuw::LLMInferRequest::infer() {
     //    both main and draft models for most of LLMs.
     if (input_ids->get_shape()[layer_ids::INPUT_IDS_SEQ_LEN_DIM] > 1 &&
         position_ids->data<int64_t>()[0] == m_first_position_id) {
+        std::cerr << "[LLM_INFER] branch=prefill"
+                  << " seq_len=" << input_ids->get_shape()[layer_ids::INPUT_IDS_SEQ_LEN_DIM]
+                  << " first_pos=" << position_ids->data<int64_t>()[0]
+                  << " first_position_id=" << m_first_position_id << std::endl;
         infer_prefill(input_ids, attention_mask, position_ids, token_type_ids);
     } else {
         // FIXME: Need to make the solution smarter.
@@ -1134,8 +1179,13 @@ void ov::npuw::LLMInferRequest::infer() {
         if (position_ids->get_shape().size() < 3) {
             trim_kvcache_for_speculative_decoding(position_ids);
         }
+        std::cerr << "[LLM_INFER] branch=generate"
+                  << " seq_len=" << input_ids->get_shape()[layer_ids::INPUT_IDS_SEQ_LEN_DIM]
+                  << " first_pos=" << position_ids->data<int64_t>()[0]
+                  << " first_position_id=" << m_first_position_id << std::endl;
         infer_generate(input_ids, attention_mask, position_ids, token_type_ids);
     }
+    std::cerr << "[LLM_INFER] end" << std::endl;
 }
 
 ov::SoPtr<ov::ITensor> ov::npuw::LLMInferRequest::get_tensor(const ov::Output<const ov::Node>& port) const {
