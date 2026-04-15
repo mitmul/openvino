@@ -9,6 +9,7 @@
 #include <set>
 #include <string>
 #include <unordered_set>
+#include <cstdlib>
 
 #include "accuracy/comparator.hpp"
 #include "intel_npu/npu_private_properties.hpp"
@@ -2327,6 +2328,53 @@ std::shared_ptr<ov::npuw::IBaseInferRequest> ov::npuw::CompiledModel::create_bas
     // selected strategy
     auto* non_const_this = const_cast<ov::npuw::CompiledModel*>(this);  // because of const in API
     auto non_const_this_sptr = std::static_pointer_cast<ov::npuw::CompiledModel>(non_const_this->shared_from_this());
+    std::ofstream link_dump("C:\\Users\\Shunta Saito\\Desktop\\npu-exp\\models\\npuw_link_dump.txt", std::ios::app);
+
+    std::cerr << "[NPUW_LINK] begin" << std::endl;
+    for (const auto& kvp : m_submodels_input_to_prev_output) {
+        const auto& subm_idx_to = kvp.first.first;
+        const auto& port_idx_to = kvp.first.second;
+        const auto& subm_idx_from = kvp.second.first;
+        const auto& port_idx_from = kvp.second.second;
+        std::string to_name = "<no-input>";
+        std::string to_shape = "<no-shape>";
+        std::string from_name = "<no-output>";
+        std::string from_shape = "<no-shape>";
+        if (subm_idx_to < m_compiled_submodels.size()) {
+            const auto& to_desc = m_compiled_submodels[subm_idx_to];
+            if (to_desc.compiled_model && port_idx_to < to_desc.compiled_model->inputs().size()) {
+                const auto& iport = to_desc.compiled_model->inputs()[port_idx_to];
+                to_name = iport.get_any_name();
+                to_shape = iport.get_partial_shape().to_string();
+            }
+        }
+        if (subm_idx_from < m_compiled_submodels.size()) {
+            const auto& from_desc = m_compiled_submodels[subm_idx_from];
+            if (from_desc.compiled_model && port_idx_from < from_desc.compiled_model->outputs().size()) {
+                const auto& oport = from_desc.compiled_model->outputs()[port_idx_from];
+                from_name = oport.get_any_name();
+                from_shape = oport.get_partial_shape().to_string();
+            }
+        }
+        std::cerr << "[NPUW_LINK] "
+                  << "Subgraph[" << subm_idx_from << "]/" << port_idx_from
+                  << " (" << from_name << ", " << from_shape << ") -> "
+                  << "Subgraph[" << subm_idx_to << "]/" << port_idx_to
+                  << " (" << to_name << ", " << to_shape << ")"
+                  << std::endl;
+        if (link_dump.is_open()) {
+            link_dump << "[NPUW_LINK] "
+                      << "Subgraph[" << subm_idx_from << "]/" << port_idx_from
+                      << " (" << from_name << ", " << from_shape << ") -> "
+                      << "Subgraph[" << subm_idx_to << "]/" << port_idx_to
+                      << " (" << to_name << ", " << to_shape << ")"
+                      << std::endl;
+        }
+    }
+    std::cerr << "[NPUW_LINK] end" << std::endl;
+    if (link_dump.is_open()) {
+        link_dump << "[NPUW_LINK] end" << std::endl;
+    }
 
     auto no_spatial_unpack = [&]() {
         const auto num_submodels = m_compiled_submodels.size();

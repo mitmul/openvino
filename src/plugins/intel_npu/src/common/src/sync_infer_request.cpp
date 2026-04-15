@@ -133,7 +133,25 @@ void SyncInferRequest::set_tensor(const ov::Output<const ov::Node>& port, const 
                      foundPort.is_input() ? _metadata.inputs.at(foundPort.idx).supportsStridedLayout
                                           : _metadata.outputs.at(foundPort.idx).supportsStridedLayout);
     } catch (const ov::Exception& ex) {
-        OPENVINO_THROW("Failed to set tensor. ", ex.what());
+        const IODescriptor& desc = foundPort.is_input() ? _metadata.inputs.at(foundPort.idx) : _metadata.outputs.at(foundPort.idx);
+        OPENVINO_THROW("Failed to set tensor. port_name=",
+                       desc.nameFromCompiler,
+                       " port_index=",
+                       foundPort.idx,
+                       " node_name=",
+                       desc.nodeFriendlyName,
+                       " shapeFromCompiler=",
+                       desc.shapeFromCompiler,
+                       " shapeFromIRModel=",
+                       (desc.shapeFromIRModel.has_value() ? desc.shapeFromIRModel.value().to_string() : std::string("<none>")),
+                       " isStateInput=",
+                       desc.isStateInput,
+                       " isStateOutput=",
+                       desc.isStateOutput,
+                       " relatedDescriptorIndex=",
+                       (desc.relatedDescriptorIndex.has_value() ? std::to_string(desc.relatedDescriptorIndex.value()) : std::string("<none>")),
+                       ". ",
+                       ex.what());
     }
 
     if (foundPort.is_input()) {

@@ -14,7 +14,27 @@
 #include "openvino/runtime/intel_npu/remote_properties.hpp"
 #include "openvino/runtime/make_tensor.hpp"
 #include "zero_variable_state.hpp"
+
+#include <sstream>
 namespace intel_npu {
+
+namespace {
+
+std::string describe_descriptor(const IODescriptor& desc, const size_t ioIndex) {
+    std::stringstream ss;
+    ss << "idx=" << ioIndex << " name=" << desc.nameFromCompiler
+       << " shapeFromCompiler=" << desc.shapeFromCompiler.to_string()
+       << " shapeFromIRModel="
+       << (desc.shapeFromIRModel.has_value() ? desc.shapeFromIRModel->to_string() : std::string("<none>"))
+       << " stateIn=" << desc.isStateInput << " stateOut=" << desc.isStateOutput
+       << " shapeTensor=" << desc.isShapeTensor
+       << " related="
+       << (desc.relatedDescriptorIndex.has_value() ? std::to_string(desc.relatedDescriptorIndex.value()) : std::string("<none>"))
+       << " node=" << desc.nodeFriendlyName;
+    return ss.str();
+}
+
+}  // namespace
 
 std::optional<size_t> determine_dynamic_batch_size(const IODescriptor& desc,
                                                    const ov::PartialShape& ioShape,
@@ -75,6 +95,12 @@ ZeroInferRequest::ZeroInferRequest(const std::shared_ptr<ZeroInitStructsHolder>&
       _levelZeroInputTensors(_metadata.inputs.size(), std::vector<std::shared_ptr<ZeroTensor>>(1, nullptr)),
       _levelZeroOutputTensors(_metadata.outputs.size(), nullptr) {
     _logger.debug("ZeroInferRequest::ZeroInferRequest - checking level zero attributes and allocating tensors");
+    for (size_t i = 0; i < _metadata.inputs.size(); ++i) {
+        _logger.debug("ZeroInferRequest::input_descriptor - %s", describe_descriptor(_metadata.inputs.at(i), i).c_str());
+    }
+    for (size_t i = 0; i < _metadata.outputs.size(); ++i) {
+        _logger.debug("ZeroInferRequest::output_descriptor - %s", describe_descriptor(_metadata.outputs.at(i), i).c_str());
+    }
 
     size_t ioIndex = 0;
     for (const IODescriptor& inputDescriptor : _metadata.inputs) {
@@ -279,13 +305,37 @@ void ZeroInferRequest::set_tensor(const ov::Output<const ov::Node>& port, const 
 
     auto foundPort = find_port(port);
     OPENVINO_ASSERT(foundPort.found(), "Cannot find tensor for port ", port);
+    const IODescriptor& desc = foundPort.is_input() ? _metadata.inputs.at(foundPort.idx) : _metadata.outputs.at(foundPort.idx);
+    _logger.debug("ZeroInferRequest::set_tensor - port_name=%s port_index=%zu tensor_shape=%s expected_shape=%s is_input=%d",
+                  desc.nameFromCompiler.c_str(),
+                  foundPort.idx,
+                  tensor ? ov::Shape(tensor->get_shape()).to_string().c_str() : "<null>",
+                  desc.shapeFromCompiler.to_string().c_str(),
+                  foundPort.is_input());
     try {
         check_tensor(port,
                      tensor,
                      foundPort.is_input() ? _metadata.inputs.at(foundPort.idx).supportsStridedLayout
                                           : _metadata.outputs.at(foundPort.idx).supportsStridedLayout);
     } catch (const ov::Exception& ex) {
-        OPENVINO_THROW("Failed to set tensor. ", ex.what());
+        OPENVINO_THROW("Failed to set tensor. port_name=",
+                       desc.nameFromCompiler,
+                       " port_index=",
+                       foundPort.idx,
+                       " node_name=",
+                       desc.nodeFriendlyName,
+                       " shapeFromCompiler=",
+                       desc.shapeFromCompiler,
+                       " shapeFromIRModel=",
+                       (desc.shapeFromIRModel.has_value() ? desc.shapeFromIRModel.value().to_string() : std::string("<none>")),
+                       " isStateInput=",
+                       desc.isStateInput,
+                       " isStateOutput=",
+                       desc.isStateOutput,
+                       " relatedDescriptorIndex=",
+                       (desc.relatedDescriptorIndex.has_value() ? std::to_string(desc.relatedDescriptorIndex.value()) : std::string("<none>")),
+                       ". ",
+                       ex.what());
     }
 
     if (foundPort.is_input()) {
@@ -565,6 +615,11 @@ ov::SoPtr<ov::ITensor> ZeroInferRequest::get_tensor(const ov::Output<const ov::N
 
     auto foundPort = find_port(port);
     OPENVINO_ASSERT(foundPort.found(), "Cannot find tensor for port ", port);
+    _logger.debug("ZeroInferRequest::get_tensor(requested) - port_node=%s port_index=%zu found_idx=%zu is_input=%d",
+                  port.get_node()->get_friendly_name().c_str(),
+                  port.get_index(),
+                  foundPort.idx,
+                  foundPort.is_input());
 
     const size_t ioIndex = foundPort.idx;
     const bool isInput = foundPort.is_input();

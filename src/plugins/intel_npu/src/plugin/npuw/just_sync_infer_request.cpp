@@ -605,8 +605,9 @@ void ov::npuw::JustInferRequest::connect_subrequests() {
             const auto& iport = subreqs[subm_idx_to]->get_compiled_model()->inputs()[port_idx_to];
             const auto& oport = subreqs[subm_idx_from]->get_compiled_model()->outputs()[port_idx_from];
             const auto& tensor = subreqs[subm_idx_from]->get_tensor(oport);
-            LOG_DEBUG("Set Subgraph[" << subm_idx_to << "]/" << iport << " to Subgraph[" << subm_idx_from << "]/"
-                                      << oport);
+            LOG_DEBUG("Set Subgraph[" << subm_idx_to << "]/" << iport << " shape=" << iport.get_partial_shape()
+                                      << " to Subgraph[" << subm_idx_from << "]/" << oport
+                                      << " tensor_shape=" << tensor->get_shape());
             subreqs[subm_idx_to]->set_tensor(iport, tensor);
         }
     }  // for(map)

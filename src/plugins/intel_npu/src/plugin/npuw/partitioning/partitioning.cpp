@@ -4,6 +4,8 @@
 
 #include "partitioning.hpp"
 
+#include <fstream>
+#include <iostream>
 #include <memory>
 #include <unordered_set>
 
@@ -1650,15 +1652,60 @@ void Partitioner::matchParameters(const std::string& func_name) {
     // In our repeated patterns, a Parameter is uniquely identified
     // by a set of its readers. A reader is a node+port.
     using PReader = std::pair<std::string, std::size_t>;
-    using PKey = std::set<PReader>;
+    using PReaders = std::set<PReader>;
+    using PKey = std::tuple<PReaders, std::string, std::string>;
+    auto pkey_to_string = [](const PKey& pkey) -> std::string {
+        const auto& readers = std::get<0>(pkey);
+        const auto& shape = std::get<1>(pkey);
+        const auto& elem_type = std::get<2>(pkey);
+        std::stringstream ss;
+        bool first = true;
+        for (const auto& reader : readers) {
+            if (!first) {
+                ss << ", ";
+            }
+            first = false;
+            ss << reader.first << ":" << reader.second;
+        }
+        ss << "; shape=" << shape;
+        ss << "; type=" << elem_type;
+        return ss.str();
+    };
 
     auto& func = all_functions.at(func_name);
     auto& model_group = func.mdls;
+    auto make_pkey = [&](const PPtr& param,
+                         const std::unordered_set<ov::Node*>& this_model_nodes,
+                         bool resolve_reader_names) -> PKey {
+        PReaders readers;
+        for (auto&& iport : param->output(0).get_target_inputs()) {
+            auto reader_node = iport.get_node()->shared_from_this();
+            if (is_f16ic_boundary_convert(reader_node)) {
+                for (auto&& next_reader_iport : reader_node->output(0).get_target_inputs()) {
+                    if (this_model_nodes.count(next_reader_iport.get_node()) == 0) {
+                        continue;
+                    }
+                    const auto reader_name = resolve_reader_names
+                                                 ? resolve_prototype_name(next_reader_iport.get_node()->get_friendly_name())
+                                                 : next_reader_iport.get_node()->get_friendly_name();
+                    LOG_DEBUG("Register link " << next_reader_iport.get_node()->get_friendly_name() << " : "
+                                               << next_reader_iport.get_index());
+                    readers.insert(PReader{reader_name, next_reader_iport.get_index()});
+                }
+            } else if (this_model_nodes.count(iport.get_node()) > 0) {
+                const auto reader_name = resolve_reader_names ? resolve_prototype_name(iport.get_node()->get_friendly_name())
+                                                              : iport.get_node()->get_friendly_name();
+                LOG_DEBUG("Register link " << iport.get_node()->get_friendly_name() << " : " << iport.get_index());
+                readers.insert(PReader{reader_name, iport.get_index()});
+            }
+        }
+        return PKey{readers, param->output(0).get_partial_shape().to_string(), param->output(0).get_element_type().get_type_name()};
+    };
 
     // FIXME: Here we rely on sacred knowledge that the first
     // subgraph in the list is the prototype... Use this to
     // initialize the proto parameter reader map
-    std::map<PKey, PPtr> proto_parameters;
+    std::map<PKey, std::vector<PPtr>> proto_parameters;
     {
         LOG_DEBUG("Generating proto pkeys...");
         LOG_BLOCK();
@@ -1667,30 +1714,16 @@ void Partitioner::matchParameters(const std::string& func_name) {
         for (auto&& node_ptr : body->get_ordered_ops()) {
             this_model_nodes.insert(node_ptr.get());
         }
-        for (auto&& node : body->get_ordered_ops()) {
-            if (ov::op::util::is_parameter(node)) {
-                PKey pkey;
-                for (auto&& iport : node->output(0).get_target_inputs()) {
-                    auto reader_node = iport.get_node()->shared_from_this();
-                    if (is_f16ic_boundary_convert(reader_node)) {
-                        for (auto&& next_reader_iport : reader_node->output(0).get_target_inputs()) {
-                            if (this_model_nodes.count(next_reader_iport.get_node()) == 0) {
-                                continue;
-                            }
-                            LOG_DEBUG("Register link " << next_reader_iport.get_node()->get_friendly_name() << " : "
-                                                       << next_reader_iport.get_index());
-                            pkey.insert(PReader{next_reader_iport.get_node()->get_friendly_name(),
-                                                next_reader_iport.get_index()});
-                        }
-                    } else if (this_model_nodes.count(iport.get_node()) > 0) {
-                        LOG_DEBUG("Register link " << iport.get_node()->get_friendly_name() << " : "
-                                                   << iport.get_index());
-                        pkey.insert(PReader{iport.get_node()->get_friendly_name(), iport.get_index()});
-                    }
-                }
-                LOG_DEBUG("Stored " << node);
-                proto_parameters[pkey] = std::dynamic_pointer_cast<PPtr::element_type>(node);
-            }
+        for (const auto& param : body->get_parameters()) {
+                auto pkey = make_pkey(param, this_model_nodes, false);
+                LOG_DEBUG("Stored " << param);
+                std::cerr << "[PROTO_PKEY] "
+                          << "func=" << func_name
+                          << " proto_param=" << param->get_friendly_name()
+                          << " readers={" << pkey_to_string(pkey) << "}"
+                          << " ordinal=" << proto_parameters[pkey].size()
+                          << std::endl;
+                proto_parameters[pkey].push_back(param);
         }
     }
 
@@ -1706,51 +1739,46 @@ void Partitioner::matchParameters(const std::string& func_name) {
         for (auto&& node_ptr : call->get_ordered_ops()) {
             this_model_nodes.insert(node_ptr.get());
         }
-        for (auto&& node : call->get_ordered_ops()) {
-            using ov::npuw::util::at::_;
-
-            if (ov::op::util::is_parameter(node)) {
-                PKey pkey;
-                for (auto&& iport : node->output(0).get_target_inputs()) {
-                    auto reader_node = iport.get_node()->shared_from_this();
-                    if (is_f16ic_boundary_convert(reader_node)) {
-                        for (auto&& next_reader_iport : reader_node->output(0).get_target_inputs()) {
-                            if (this_model_nodes.count(next_reader_iport.get_node()) == 0) {
-                                continue;
-                            }
-                            LOG_DEBUG("Register link " << next_reader_iport.get_node()->get_friendly_name() << " : "
-                                                       << next_reader_iport.get_index());
-                            pkey.insert(PReader{resolve_prototype_name(next_reader_iport.get_node()->get_friendly_name()),
-                                                next_reader_iport.get_index()});
-                        }
-                    } else if (this_model_nodes.count(iport.get_node()) > 0) {
-                        LOG_DEBUG("Register link " << iport.get_node()->get_friendly_name() << " : "
-                                                   << iport.get_index());
-                        pkey.insert(PReader{resolve_prototype_name(iport.get_node()->get_friendly_name()),
-                                            iport.get_index()});
-                    }
-                }
-                LOG_DEBUG("Find orig parameter for " << node);
+        std::map<PKey, std::size_t> matched_key_occurrence;
+        for (const auto& this_param : call->get_parameters()) {
+                auto pkey = make_pkey(this_param, this_model_nodes, true);
+                LOG_DEBUG("Find orig parameter for " << this_param);
                 auto proto_param_it = proto_parameters.find(pkey);
                 if (proto_param_it == proto_parameters.end()) {
-                    std::stringstream ss;
-                    for (const auto& reader : pkey) {
-                        if (ss.tellp() > 0) {
-                            ss << ", ";
-                        }
-                        ss << reader.first << ":" << reader.second;
-                    }
                     OPENVINO_THROW("Couldn't resolve prototype parameter for node ",
-                                   node->get_friendly_name(),
-                                   " with ",
-                                   pkey.size(),
-                                   " reader link(s): ",
-                                   ss.str());
+                                   this_param->get_friendly_name(),
+                                   " with key {",
+                                   pkey_to_string(pkey),
+                                   "}");
                 }
-                auto& orig_param = proto_param_it->second;
-                auto this_param = std::dynamic_pointer_cast<PPtr::element_type>(node);
+                auto matched_idx = matched_key_occurrence[pkey]++;
+                if (matched_idx >= proto_param_it->second.size()) {
+                    OPENVINO_THROW("Prototype parameter key over-consumed for function ",
+                                   func_name,
+                                   " by node ",
+                                   this_param->get_friendly_name(),
+                                   " with key {",
+                                   pkey_to_string(pkey),
+                                   "} at ordinal ",
+                                   matched_idx,
+                                   ", candidate count=",
+                                   proto_param_it->second.size());
+                }
+                auto& orig_param = proto_param_it->second[matched_idx];
                 func.param_call_to_proto[SubgParam(subg_ref, this_param)] = orig_param;
-            }
+                std::cerr << "[CALL_PKEY] "
+                          << "func=" << func_name
+                          << " call_id=" << call_id
+                          << " call_param=" << this_param->get_friendly_name()
+                          << " readers={" << pkey_to_string(pkey) << "}"
+                          << " ordinal=" << matched_idx
+                          << std::endl;
+                std::cerr << "[MATCH_PARAM] "
+                          << "func=" << func_name
+                          << " call_id=" << call_id
+                          << " call_param=" << this_param->get_friendly_name()
+                          << " -> proto_param=" << orig_param->get_friendly_name()
+                          << std::endl;
         }
     }
     LOG_VERB("Done");
@@ -2686,6 +2714,7 @@ void Partitioner::decompressionCutOff(const std::string& func_name) {
 void Partitioner::finalizeLinks() {
     LOG_VERB("Finalizing links in model " << model->get_friendly_name() << "...");
     LOG_BLOCK();
+    std::cerr << "[FINALIZE_LINKS] model=" << model->get_friendly_name() << std::endl;
 
     // Write down the [subgraph_i][out_j] -> [subgraph_k][input_n]
     // mapping here. I/J & K/N indices become final at this point
@@ -2711,10 +2740,21 @@ void Partitioner::finalizeLinks() {
                                     if (it == call_to_proto.end()) {
                                         OPENVINO_THROW("Couldn't resolve subgraph parameter to prototype mapping");
                                     }
+                                    std::cerr << "[PARAM_TO_PROTO] "
+                                              << "func=" << sg_desc._funcall
+                                              << " call_param=" << ptr->get_friendly_name()
+                                              << " -> proto_param=" << it->second->get_friendly_name()
+                                              << std::endl;
                                     return it->second;
                                 }();
             auto param_iter = std::find(params.begin(), params.end(), proto);
             NPUW_ASSERT(param_iter != params.end());
+            std::cerr << "[GET_IDX_PARAM] "
+                      << "func=" << sg_desc._funcall
+                      << " call_param=" << ptr->get_friendly_name()
+                      << " proto_param=" << proto->get_friendly_name()
+                      << " idx=" << std::distance(params.begin(), param_iter)
+                      << std::endl;
             return std::distance(params.begin(), param_iter);
         }
     };
@@ -2771,7 +2811,23 @@ void Partitioner::finalizeLinks() {
         LOG_BLOCK();
         LOG_DEBUG("Record link [" << subgraph_idx_to << "]:" << param_idx << "  <---  [" << subgraph_idx_from << "]/"
                                   << result_idx);
+        const auto param_name = subgraph_param_to ? subgraph_param_to->get_friendly_name() : std::string("<null>");
+        const auto result_name = subgraph_result_from ? subgraph_result_from->get_friendly_name() : std::string("<null>");
+        const auto result_src_name =
+            (subgraph_result_from && subgraph_result_from->get_input_size() > 0)
+                ? subgraph_result_from->input_value(0).get_node_shared_ptr()->get_friendly_name()
+                : std::string("<no-source>");
+        std::cerr << "[FINALIZE_LINKS] "
+                  << "to_subgraph=" << subgraph_idx_to
+                  << " to_param_idx=" << param_idx
+                  << " to_param_name=" << param_name
+                  << " from_subgraph=" << subgraph_idx_from
+                  << " from_result_idx=" << result_idx
+                  << " from_result_name=" << result_name
+                  << " from_result_source=" << result_src_name
+                  << std::endl;
     }
+    std::cerr << "[FINALIZE_LINKS] end" << std::endl;
     LOG_VERB("Done");
 }
 

@@ -5,6 +5,9 @@
 #include "llm_infer_request.hpp"
 
 #include <regex>
+#include <cstdlib>
+#include <fstream>
+#include <sstream>
 
 #include "infer_request_utils.hpp"
 #include "llm_compiled_model.hpp"
@@ -15,6 +18,27 @@
 
 namespace {
 using ov::npuw::LLMInferRequest;
+
+std::string shape_to_string(const ov::Shape& shape) {
+    std::stringstream ss;
+    ss << "[";
+    for (size_t i = 0; i < shape.size(); ++i) {
+        if (i > 0) {
+            ss << ",";
+        }
+        ss << shape[i];
+    }
+    ss << "]";
+    return ss.str();
+}
+
+void append_llm_dump(const std::string& line) {
+    std::ofstream dump("C:\\Users\\Shunta Saito\\Desktop\\npu-exp\\models\\npuw_link_dump.txt", std::ios::app);
+    if (!dump.is_open()) {
+        return;
+    }
+    dump << line << std::endl;
+}
 
 void copy_columns_by_row_chunks_2d(ov::SoPtr<ov::ITensor> src, ov::SoPtr<ov::ITensor>& dst) {
     const auto& src_shape = src->get_shape();
@@ -326,9 +350,17 @@ void ov::npuw::LLMInferRequest::create_generate_request_variants(
 
         for (const auto& input_port : generate_request->get_compiled_model()->inputs()) {
             variant_in_ports.emplace(input_port.get_any_name(), input_port);
+            LOG_DEBUG("GenerateVariant[" << i << "] input " << input_port.get_any_name() << " "
+                                        << input_port.get_partial_shape());
+            append_llm_dump("GenerateVariant[" + std::to_string(i) + "] input " +
+                            input_port.get_any_name() + " " + input_port.get_partial_shape().to_string());
         }
         for (const auto& output_port : generate_request->get_compiled_model()->outputs()) {
             variant_out_ports.emplace(output_port.get_any_name(), output_port);
+            LOG_DEBUG("GenerateVariant[" << i << "] output " << output_port.get_any_name() << " "
+                                         << output_port.get_partial_shape());
+            append_llm_dump("GenerateVariant[" + std::to_string(i) + "] output " +
+                            output_port.get_any_name() + " " + output_port.get_partial_shape().to_string());
         }
 
         m_generate_variant_in_ports.emplace(generate_request, std::move(variant_in_ports));
@@ -341,6 +373,14 @@ void ov::npuw::LLMInferRequest::create_generate_request_variants(
     // Need to set ports to ensure tensors aren't empty during bind_past_kv()
     m_kvcache_in_ports = m_generate_variant_in_ports.at(m_kvcache_request);
     m_kvcache_out_ports = m_generate_variant_out_ports.at(m_kvcache_request);
+    for (const auto& input_port : m_prefill_request->get_compiled_model()->inputs()) {
+        LOG_DEBUG("Prefill input " << input_port.get_any_name() << " " << input_port.get_partial_shape());
+        append_llm_dump("Prefill input " + input_port.get_any_name() + " " + input_port.get_partial_shape().to_string());
+    }
+    for (const auto& output_port : m_prefill_request->get_compiled_model()->outputs()) {
+        LOG_DEBUG("Prefill output " << output_port.get_any_name() << " " << output_port.get_partial_shape());
+        append_llm_dump("Prefill output " + output_port.get_any_name() + " " + output_port.get_partial_shape().to_string());
+    }
 }
 
 std::shared_ptr<ov::IAsyncInferRequest> ov::npuw::LLMInferRequest::select_generate_request(int64_t prompt_length) {
@@ -513,6 +553,12 @@ void ov::npuw::LLMInferRequest::copy_kvcache() {
         const auto& pre_kv_dim = kv_dim(kvcache_desc.v_tensors_transposed_pre);
         const auto& gen_kv_dim = kv_dim(kvcache_desc.v_tensors_transposed_gen);
         auto kvcache_in_tensor = m_kvcache_request->get_tensor(m_kvcache_in_ports.at(input_name));
+        LOG_DEBUG("copy_kvcache map " << output_name << " -> " << input_name
+                                      << " prefill_shape=" << prefill_out_tensor->get_shape()
+                                      << " generate_shape=" << kvcache_in_tensor->get_shape());
+        append_llm_dump("copy_kvcache map " + output_name + " -> " + input_name +
+                        " prefill_shape=" + shape_to_string(prefill_out_tensor->get_shape()) +
+                        " generate_shape=" + shape_to_string(kvcache_in_tensor->get_shape()));
 
         const auto prefill_chunk_size = m_npuw_llm_compiled_model->m_prefill_chunk_size;
         const bool use_chunk_prefill = m_npuw_llm_compiled_model->m_use_chunk_prefill;
