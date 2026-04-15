@@ -143,6 +143,7 @@ void ov::npuw::LLMInferRequest::init_lora_states() {
 
 ov::npuw::LLMInferRequest::LLMInferRequest(const std::shared_ptr<ov::npuw::LLMCompiledModel>& compiled_model)
     : ov::npuw::LLMInferBaseRequest(compiled_model) {
+    std::cerr << "[LLM_IR_CTOR] begin" << std::endl;
     init_ports();
 
     auto input_ids_port =
@@ -157,10 +158,15 @@ ov::npuw::LLMInferRequest::LLMInferRequest(const std::shared_ptr<ov::npuw::LLMCo
     }
 
     // Create and initialize generate request variants with memory sharing
+    std::cerr << "[LLM_IR_CTOR] before create_generate_request_variants" << std::endl;
     create_generate_request_variants(compiled_model);
+    std::cerr << "[LLM_IR_CTOR] after create_generate_request_variants" << std::endl;
 
+    std::cerr << "[LLM_IR_CTOR] before create_base_infer_request(prefill)" << std::endl;
     m_prefill_base_request = compiled_model->m_prefill_compiled->create_base_infer_request();
+    std::cerr << "[LLM_IR_CTOR] after create_base_infer_request(prefill)" << std::endl;
     m_prefill_request = compiled_model->m_prefill_compiled->wrap_async_infer_request(m_prefill_base_request);
+    std::cerr << "[LLM_IR_CTOR] after wrap_async_infer_request(prefill)" << std::endl;
 
     for (const auto& input_port : m_prefill_request->get_compiled_model()->inputs()) {
         m_prefill_in_ports.emplace(input_port.get_any_name(), input_port);
@@ -244,6 +250,7 @@ ov::npuw::LLMInferRequest::LLMInferRequest(const std::shared_ptr<ov::npuw::LLMCo
     }
 
     m_generate_initialized = false;
+    std::cerr << "[LLM_IR_CTOR] end" << std::endl;
 }
 
 std::string ov::npuw::LLMInferRequest::init_pre_alloc_device() {
@@ -295,11 +302,15 @@ void ov::npuw::LLMInferRequest::bind_past_kv() {
 
 void ov::npuw::LLMInferRequest::create_generate_request_variants(
     const std::shared_ptr<ov::npuw::LLMCompiledModel>& compiled_model) {
+    std::cerr << "[CREATE_GEN_VARIANTS] begin count=" << compiled_model->m_generate_compiled_variants.size() << std::endl;
     // Create multiple generate model variants' requests
     m_generate_requests.reserve(compiled_model->m_generate_compiled_variants.size());
 
     // First, create the largest variant request (last one in the list)
+    std::cerr << "[CREATE_GEN_VARIANTS] before largest create_infer_request idx="
+              << (compiled_model->m_generate_compiled_variants.size() - 1) << std::endl;
     auto largest_generate_request = compiled_model->m_generate_compiled_variants.back()->create_infer_request();
+    std::cerr << "[CREATE_GEN_VARIANTS] after largest create_infer_request" << std::endl;
 
     // Store past KV tensors from the largest variant for sharing
     std::unordered_map<std::string, ov::SoPtr<ov::ITensor>> largest_past_kv_tensors;
@@ -319,7 +330,9 @@ void ov::npuw::LLMInferRequest::create_generate_request_variants(
             generate_request = largest_generate_request;
         } else {
             // Create smaller variant
+            std::cerr << "[CREATE_GEN_VARIANTS] before small create_infer_request idx=" << i << std::endl;
             generate_request = compiled_model->m_generate_compiled_variants[i]->create_infer_request();
+            std::cerr << "[CREATE_GEN_VARIANTS] after small create_infer_request idx=" << i << std::endl;
 
             // Share past KV tensors from the largest variant
             for (const auto& input_port : generate_request->get_compiled_model()->inputs()) {
@@ -343,6 +356,7 @@ void ov::npuw::LLMInferRequest::create_generate_request_variants(
         }
 
         m_generate_requests.push_back(generate_request);
+        std::cerr << "[CREATE_GEN_VARIANTS] pushed idx=" << i << std::endl;
 
         // Build input/output ports mapping for this variant
         std::unordered_map<std::string, ov::Output<const ov::Node>> variant_in_ports;
@@ -369,18 +383,17 @@ void ov::npuw::LLMInferRequest::create_generate_request_variants(
 
     // Set default to the largest variant for backward compatibility
     m_kvcache_request = m_generate_requests.back();
+    std::cerr << "[CREATE_GEN_VARIANTS] after default request select" << std::endl;
 
-    // Need to set ports to ensure tensors aren't empty during bind_past_kv()
+    // Cache selected generate ports here. Prefill ports are initialized later in the constructor
+    // after m_prefill_request is created.
+    std::cerr << "[CREATE_GEN_VARIANTS] before cache selected in ports" << std::endl;
     m_kvcache_in_ports = m_generate_variant_in_ports.at(m_kvcache_request);
+    std::cerr << "[CREATE_GEN_VARIANTS] after cache selected in ports" << std::endl;
+    std::cerr << "[CREATE_GEN_VARIANTS] before cache selected out ports" << std::endl;
     m_kvcache_out_ports = m_generate_variant_out_ports.at(m_kvcache_request);
-    for (const auto& input_port : m_prefill_request->get_compiled_model()->inputs()) {
-        LOG_DEBUG("Prefill input " << input_port.get_any_name() << " " << input_port.get_partial_shape());
-        append_llm_dump("Prefill input " + input_port.get_any_name() + " " + input_port.get_partial_shape().to_string());
-    }
-    for (const auto& output_port : m_prefill_request->get_compiled_model()->outputs()) {
-        LOG_DEBUG("Prefill output " << output_port.get_any_name() << " " << output_port.get_partial_shape());
-        append_llm_dump("Prefill output " + output_port.get_any_name() + " " + output_port.get_partial_shape().to_string());
-    }
+    std::cerr << "[CREATE_GEN_VARIANTS] after cache selected out ports" << std::endl;
+    std::cerr << "[CREATE_GEN_VARIANTS] end" << std::endl;
 }
 
 std::shared_ptr<ov::IAsyncInferRequest> ov::npuw::LLMInferRequest::select_generate_request(int64_t prompt_length) {

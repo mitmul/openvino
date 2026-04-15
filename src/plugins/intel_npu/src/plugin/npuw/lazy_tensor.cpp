@@ -261,19 +261,36 @@ bool Unpack::operator==(const Unpack& other) const {
 
 ov::Tensor Unpack::eval() const {
     const auto& gti = ov::get_tensor_impl;
-    const auto& tw = w.eval();
-    const auto& tz = z.eval();
-    const auto& ts = s.eval();
-    NPUW_ASSERT(tw);
-    ov::Tensor dst(type, shape);
-    if (tw && tz && ts) {
-        ov::npuw::util::unpack(gti(tw), gti(tz), gti(ts), gti(dst));
-    } else if (tw && ts) {
-        ov::npuw::util::unpack(gti(tw), gti(ts), gti(dst));
-    } else {
-        NPUW_ASSERT(false && "Unsupported combination");
+    try {
+        const auto& tw = w.eval();
+        const auto& tz = z.eval();
+        const auto& ts = s.eval();
+        NPUW_ASSERT(tw);
+        ov::Tensor dst(type, shape);
+        if (tw && tz && ts) {
+            ov::npuw::util::unpack(gti(tw), gti(tz), gti(ts), gti(dst));
+        } else if (tw && ts) {
+            ov::npuw::util::unpack(gti(tw), gti(ts), gti(dst));
+        } else {
+            NPUW_ASSERT(false && "Unsupported combination");
+        }
+        return dst;
+    } catch (const std::exception& ex) {
+        const auto w_meta = w.eval_meta();
+        const auto z_meta = z ? z.eval_meta() : LazyTensor::Meta{{}, ov::element::dynamic};
+        const auto s_meta = s ? s.eval_meta() : LazyTensor::Meta{{}, ov::element::dynamic};
+        LOG_ERROR("LazyTensor::Unpack::eval failed"
+                  << " dst_type=" << type
+                  << " dst_shape=" << shape
+                  << " w_type=" << w_meta.type
+                  << " w_shape=" << w_meta.shape
+                  << " z_type=" << z_meta.type
+                  << " z_shape=" << z_meta.shape
+                  << " s_type=" << s_meta.type
+                  << " s_shape=" << s_meta.shape
+                  << " error=" << ex.what());
+        throw;
     }
-    return dst;
 }
 
 LazyTensor::Meta Unpack::eval_meta() const {

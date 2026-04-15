@@ -170,15 +170,26 @@ void Bank::evaluate_and_allocate_on_device(Bank::DeviceBank& device_bank,
     ov::parallel_for(uids_to_allocated.size(), [&](std::size_t idx) {
         auto& allocated = uids_to_allocated[idx];
         auto& stored_tensor = device_bank.storage.at(allocated.uid);
+        try {
+            auto transformed = stored_tensor.lt.eval();
+            transformed.copy_to(allocated.allocated_tensor);
+            stored_tensor.tensor = std::move(allocated.allocated_tensor);
 
-        auto transformed = stored_tensor.lt.eval();
-        transformed.copy_to(allocated.allocated_tensor);
-        stored_tensor.tensor = std::move(allocated.allocated_tensor);
-
-        // Detach the evaluated LazyTensor from its memory here - when it is 100%
-        // not needed anymore (transformations, if any, and copies are done)
-        // Note: this is the non-CPU path!
-        const_cast<LazyTensor&>(stored_tensor.lt).detach();
+            // Detach the evaluated LazyTensor from its memory here - when it is 100%
+            // not needed anymore (transformations, if any, and copies are done)
+            // Note: this is the non-CPU path!
+            const_cast<LazyTensor&>(stored_tensor.lt).detach();
+        } catch (const std::exception& ex) {
+            const auto meta = stored_tensor.lt.eval_meta();
+            LOG_ERROR("WeightsBank evaluate_and_allocate_on_device failed"
+                      << " bank=" << m_bank_name
+                      << " device=" << device
+                      << " uid=" << allocated.uid
+                      << " meta_type=" << meta.type
+                      << " meta_shape=" << meta.shape
+                      << " error=" << ex.what());
+            throw;
+        }
     });
 }
 

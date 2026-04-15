@@ -306,10 +306,15 @@ void ZeroInferRequest::set_tensor(const ov::Output<const ov::Node>& port, const 
     auto foundPort = find_port(port);
     OPENVINO_ASSERT(foundPort.found(), "Cannot find tensor for port ", port);
     const IODescriptor& desc = foundPort.is_input() ? _metadata.inputs.at(foundPort.idx) : _metadata.outputs.at(foundPort.idx);
-    _logger.debug("ZeroInferRequest::set_tensor - port_name=%s port_index=%zu tensor_shape=%s expected_shape=%s is_input=%d",
+    _logger.debug("ZeroInferRequest::set_tensor - port_name=%s port_index=%zu tensor_type=%s tensor_shape=%s expected_type=%s expected_shape=%s is_input=%d",
                   desc.nameFromCompiler.c_str(),
                   foundPort.idx,
+                  tensor ? tensor->get_element_type().to_string().c_str() : "<null>",
                   tensor ? ov::Shape(tensor->get_shape()).to_string().c_str() : "<null>",
+                  (foundPort.is_input() ? _compiledModel->inputs()[foundPort.idx] : _compiledModel->outputs()[foundPort.idx])
+                      .get_element_type()
+                      .to_string()
+                      .c_str(),
                   desc.shapeFromCompiler.to_string().c_str(),
                   foundPort.is_input());
     try {
@@ -423,6 +428,7 @@ void ZeroInferRequest::update_command_list_for_tensor(SyncInferRequest::FoundPor
                                                       const ov::SoPtr<ov::ITensor>& tensor) {
     OV_ITT_TASK_CHAIN(ZERO_SET_TENSOR, itt::domains::LevelZeroBackend, "set_tensor", "update_command_list_for_tensor");
     const bool isMutableCommandListSupported = _initStructs->getMutableCommandListExtVersion() >= ZE_MAKE_VERSION(1, 0);
+    const IODescriptor& desc = foundPort.is_input() ? _metadata.inputs.at(foundPort.idx) : _metadata.outputs.at(foundPort.idx);
     auto& levelZeroTensor =
         foundPort.is_input() ? get_level_zero_input(foundPort.idx) : _levelZeroOutputTensors.at(foundPort.idx);
 
@@ -480,8 +486,15 @@ void ZeroInferRequest::update_command_list_for_tensor(SyncInferRequest::FoundPor
     // corner case for boolean inputs as compiler maps them to u8
     const auto& userTensorElementType = tensor->get_element_type();
     if (userTensorElementType == ov::element::boolean && levelZeroTensor->get_element_type() == ov::element::u8) {
+        _logger.debug("ZeroInferRequest::set_tensor - boolean input mapped to u8 port_name=%s port_index=%zu",
+                      desc.nameFromCompiler.c_str(),
+                      foundPort.idx);
         levelZeroTensor->set_element_type(userTensorElementType);
     }
+    _logger.debug("ZeroInferRequest::set_tensor - completed port_name=%s port_index=%zu level_zero_type=%s",
+                  desc.nameFromCompiler.c_str(),
+                  foundPort.idx,
+                  levelZeroTensor->get_element_type().to_string().c_str());
     // If command list updates are not supported, fallback to copying tensors every time.
 }
 

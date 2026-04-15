@@ -2400,11 +2400,16 @@ std::shared_ptr<ov::npuw::IBaseInferRequest> ov::npuw::CompiledModel::create_bas
 
     std::shared_ptr<ov::npuw::IBaseInferRequest> result;
     if (m_cfg.get<::intel_npu::NPUW_UNFOLD_IREQS>() && no_spatial_unpack()) {
+        std::cerr << "[CREATE_BASE_IR] choosing UnfoldInferRequest" << std::endl;
         result = std::make_shared<ov::npuw::UnfoldInferRequest>(non_const_this_sptr);
+        std::cerr << "[CREATE_BASE_IR] created UnfoldInferRequest" << std::endl;
     } else {
+        std::cerr << "[CREATE_BASE_IR] choosing JustInferRequest" << std::endl;
         result = std::make_shared<ov::npuw::JustInferRequest>(non_const_this_sptr);
+        std::cerr << "[CREATE_BASE_IR] created JustInferRequest" << std::endl;
     }
     NPUW_ASSERT(result);
+    std::cerr << "[CREATE_BASE_IR] returning request" << std::endl;
     return result;
 }
 
