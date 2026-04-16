@@ -542,6 +542,10 @@ void ov::npuw::LLMInferRequest::prepare_for_new_conversation(int64_t prompt_leng
 
 void ov::npuw::LLMInferRequest::copy_kvcache() {
     namespace uu = ov::npuw::util;
+    auto is_plamo2_mamba_state_tensor = [](const ov::SoPtr<ov::ITensor>& tensor) {
+        const auto& shape = tensor->get_shape();
+        return shape.size() == 4u && shape[1] == 1u && shape[3] > 1024u;
+    };
     LOG_DEBUG("Copying kv-cache from prefill to generate model.");
     LOG_BLOCK();
     auto& kvcache_desc = m_npuw_llm_compiled_model->m_kvcache_desc;
@@ -566,12 +570,33 @@ void ov::npuw::LLMInferRequest::copy_kvcache() {
         const auto& pre_kv_dim = kv_dim(kvcache_desc.v_tensors_transposed_pre);
         const auto& gen_kv_dim = kv_dim(kvcache_desc.v_tensors_transposed_gen);
         auto kvcache_in_tensor = m_kvcache_request->get_tensor(m_kvcache_in_ports.at(input_name));
+        if (output_name.find("present.0.") != std::string::npos || output_name.find("present.1.") != std::string::npos) {
+            std::cerr << "[COPY_KVCACHE] " << output_name << " -> " << input_name
+                      << " prefill_shape=" << prefill_out_tensor->get_shape()
+                      << " generate_shape=" << kvcache_in_tensor->get_shape() << std::endl;
+        }
         LOG_DEBUG("copy_kvcache map " << output_name << " -> " << input_name
                                       << " prefill_shape=" << prefill_out_tensor->get_shape()
                                       << " generate_shape=" << kvcache_in_tensor->get_shape());
         append_llm_dump("copy_kvcache map " + output_name + " -> " + input_name +
                         " prefill_shape=" + shape_to_string(prefill_out_tensor->get_shape()) +
                         " generate_shape=" + shape_to_string(kvcache_in_tensor->get_shape()));
+
+        if (is_plamo2_mamba_state_tensor(prefill_out_tensor) && is_plamo2_mamba_state_tensor(kvcache_in_tensor)) {
+            std::cerr << "[COPY_KVCACHE] mamba_direct_copy " << output_name
+                      << " prefill_shape=" << prefill_out_tensor->get_shape()
+                      << " generate_shape=" << kvcache_in_tensor->get_shape() << std::endl;
+            if (prefill_out_tensor->get_shape() == kvcache_in_tensor->get_shape()) {
+                prefill_out_tensor->copy_to(kvcache_in_tensor._ptr);
+            } else {
+                const auto common_seq = static_cast<uint32_t>(
+                    std::min(prefill_out_tensor->get_shape()[pre_kv_dim], kvcache_in_tensor->get_shape()[gen_kv_dim]));
+                auto prefill_slice = uu::make_tensor_slice(prefill_out_tensor, pre_kv_dim, 0u, common_seq);
+                auto generate_slice = uu::make_tensor_slice(kvcache_in_tensor, gen_kv_dim, 0u, common_seq);
+                uu::copy_tensor_by_dim(prefill_slice, generate_slice, pre_kv_dim, gen_kv_dim);
+            }
+            return;
+        }
 
         const auto prefill_chunk_size = m_npuw_llm_compiled_model->m_prefill_chunk_size;
         const bool use_chunk_prefill = m_npuw_llm_compiled_model->m_use_chunk_prefill;

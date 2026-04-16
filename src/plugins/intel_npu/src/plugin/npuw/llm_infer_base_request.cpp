@@ -8,6 +8,13 @@
 
 #include "infer_request_utils.hpp"
 
+namespace {
+bool is_plamo2_mamba_state_tensor(const ov::SoPtr<ov::ITensor>& tensor) {
+    const auto& shape = tensor->get_shape();
+    return shape.size() == 4u && shape[1] == 1u && shape[3] > 1024u;
+}
+}  // namespace
+
 void ov::npuw::LLMInferBaseRequest::update_kvcache_for(
     std::shared_ptr<ov::IAsyncInferRequest> request,
     const std::unordered_map<std::string, ov::Output<const ov::Node>>& in_ports,
@@ -28,11 +35,30 @@ void ov::npuw::LLMInferBaseRequest::update_kvcache_for(
         }
         auto dst_tensor = request->get_tensor(in_ports.at(input_name));
         const auto& kv_dim = (output_name.find("value") != std::string::npos && v_transposed) ? 3u : kvcache_desc.dim;
+        auto src_tensor = request->get_tensor(out_ports.at(output_name));
+
+        if (is_plamo2_mamba_state_tensor(src_tensor) && is_plamo2_mamba_state_tensor(dst_tensor)) {
+            if (output_name.find("present.0.") != std::string::npos || output_name.find("present.1.") != std::string::npos) {
+                std::cerr << "[UPDATE_KVCACHE] mamba_direct_copy " << output_name
+                          << " src_shape=" << src_tensor->get_shape()
+                          << " dst_shape=" << dst_tensor->get_shape() << std::endl;
+            }
+            if (src_tensor->get_shape() == dst_tensor->get_shape()) {
+                src_tensor->copy_to(dst_tensor._ptr);
+            } else {
+                const auto common_seq =
+                    static_cast<uint32_t>(std::min(src_tensor->get_shape()[kv_dim], dst_tensor->get_shape()[kv_dim]));
+                auto src_slice = uu::make_tensor_slice(src_tensor, kv_dim, 0u, common_seq);
+                auto dst_slice = uu::make_tensor_slice(dst_tensor, kv_dim, 0u, common_seq);
+                uu::copy_tensor_by_dim(src_slice, dst_slice, kv_dim, kv_dim);
+            }
+            continue;
+        }
+
         auto dst_slice = uu::make_tensor_slice(dst_tensor,
                                                kv_dim,
                                                kvcache_desc.num_stored_tokens - num_tokens,
                                                kvcache_desc.num_stored_tokens);
-        auto src_tensor = request->get_tensor(out_ports.at(output_name));
 
         // NOTE: Sometimes present kv layer can contain greater seq_len
         //       than was sent to be processed

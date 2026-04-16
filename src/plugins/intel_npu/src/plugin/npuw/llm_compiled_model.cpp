@@ -1075,6 +1075,19 @@ void reshape_to_static(std::shared_ptr<ov::Model> model,
                        const KVAxesPosition& kv_axes_position,
                        const uint32_t lora_rank,
                        const uint32_t lhs_seq_size = 0) {
+    auto is_plamo2_mamba_external_state = [](const ov::Output<const ov::Node>& input) {
+        const auto& input_name = input.get_any_name();
+        if (input_name.find("past_key_values.") == std::string::npos) {
+            return false;
+        }
+        const auto& pshape = input.get_partial_shape();
+        if (pshape.size() != 4u) {
+            return false;
+        }
+        return pshape[1].is_static() && pshape[1].get_length() == 1 && pshape[3].is_static() &&
+               pshape[3].get_length() > 1024;
+    };
+
     std::map<std::string, ov::PartialShape> new_shapes;
     for (const auto& input : model->inputs()) {
         const auto& input_name = input.get_any_name();
@@ -1121,6 +1134,11 @@ void reshape_to_static(std::shared_ptr<ov::Model> model,
             const auto& partial_shape = input.get_partial_shape();
             new_shape = partial_shape;
             new_shape[kv_axes_position.batch] = 1;
+            if (is_plamo2_mamba_external_state(input)) {
+                // PLaMo2 Mamba external states are recurrent states, not token history.
+                // Keep seq=1 instead of expanding them to the KV-cache length.
+                new_shape[kv_axes_position.seq_len] = 1;
+            } else
             if (lhs_seq_size) {  // Whisper model
                 new_shape[kv_axes_position.seq_len] = (input_name.find(".decoder") != std::string::npos)
                                                           ? kvcache_size - input_size  // kv_size for decoder
