@@ -19,6 +19,22 @@
 #include "pyramid_attention.hpp"
 #include "weights_bank.hpp"
 
+namespace {
+void run_request_sync_compatible(const ov::SoPtr<ov::IAsyncInferRequest>& request) {
+    try {
+        request->infer();
+    } catch (const std::exception& ex) {
+        static constexpr const char* kSequentialModeMsg =
+            "Only start async is supported when RUN_INFERENCES_SEQUENTIALLY is enabled!";
+        if (std::string_view(ex.what()).find(kSequentialModeMsg) == std::string_view::npos) {
+            throw;
+        }
+        request->start_async();
+        request->wait();
+    }
+}
+}  // namespace
+
 // ====================================================================================================
 // ISubrequestAccessor Interface Implementation
 // ====================================================================================================
@@ -1764,7 +1780,7 @@ void ov::npuw::JustInferRequest::run_hfa_tiled_inference(std::size_t real_idx, s
             }
             request->wait();
         } else {
-            request->infer();
+            run_request_sync_compatible(request);
         }
     };
 
@@ -1876,7 +1892,7 @@ void ov::npuw::JustInferRequest::unsafe_infer_spatial(std::size_t real_idx, std:
         }  // for(outputs)
 
         // Now run the part
-        r->infer();
+        run_request_sync_compatible(r);
     }  // for(full_nway_times)
 
     // Now process the tail, if required
@@ -1902,7 +1918,7 @@ void ov::npuw::JustInferRequest::unsafe_infer_spatial(std::size_t real_idx, std:
         }  // for(outputs)
 
         // Now run the tail infer
-        r->infer();
+        run_request_sync_compatible(r);
 
         // Now copy the views from the output full-nway tensor to the output tensors
         for (std::size_t out_idx = 0u; out_idx < num_outputs; out_idx++) {
@@ -1931,7 +1947,7 @@ void ov::npuw::JustInferRequest::unsafe_infer(std::size_t real_idx, std::size_t 
         // Use MoEExecutor
         m_moe_executor->run(real_idx, idx);
     } else {
-        r->infer();  // Run normally
+        run_request_sync_compatible(r);  // Run normally
     }
 }
 

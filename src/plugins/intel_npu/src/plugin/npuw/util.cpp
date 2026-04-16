@@ -61,6 +61,27 @@ inline uint8_t lo4(uint8_t x) {
     return x & 0xF;
 }
 
+void convert_bool_u8(const ov::SoPtr<ov::ITensor>& from, const ov::SoPtr<ov::ITensor>& to) {
+    NPUW_ASSERT(from->is_continuous());
+    NPUW_ASSERT(to->is_continuous());
+    NPUW_ASSERT(from->get_size() == to->get_size());
+    const auto size = from->get_size();
+    if (from->get_element_type() == ov::element::boolean && to->get_element_type() == ov::element::u8) {
+        const bool* src = from->data<bool>();
+        uint8_t* dst = to->data<uint8_t>();
+        ov::parallel_for(size, [&](size_t idx) {
+            dst[idx] = src[idx] ? 1u : 0u;
+        });
+        return;
+    }
+    NPUW_ASSERT(from->get_element_type() == ov::element::u8 && to->get_element_type() == ov::element::boolean);
+    const uint8_t* src = from->data<uint8_t>();
+    bool* dst = to->data<bool>();
+    ov::parallel_for(size, [&](size_t idx) {
+        dst[idx] = src[idx] != 0u;
+    });
+}
+
 void unpack_nf4f16(const ov::SoPtr<ov::ITensor>& from,
                    const ov::SoPtr<ov::ITensor>& scale,
                    const ov::SoPtr<ov::ITensor>& to,
@@ -180,6 +201,12 @@ void ov::npuw::util::unpack(const ov::SoPtr<ov::ITensor>& from,
     // This is in fact a weight decompression procedure
     auto type_from = from->get_element_type();
     auto type_to = to->get_element_type();
+
+    if ((type_from == ov::element::boolean && type_to == ov::element::u8) ||
+        (type_from == ov::element::u8 && type_to == ov::element::boolean)) {
+        convert_bool_u8(from, to);
+        return;
+    }
 
     // FIXME: Move under common switch when XARCH::unpack is implemented
     if (type_from == ov::element::nf4 && type_to == ov::element::f16) {
