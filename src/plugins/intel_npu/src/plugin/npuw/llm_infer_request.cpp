@@ -5,9 +5,6 @@
 #include "llm_infer_request.hpp"
 
 #include <regex>
-#include <cstdlib>
-#include <fstream>
-#include <sstream>
 
 #include "infer_request_utils.hpp"
 #include "llm_compiled_model.hpp"
@@ -18,27 +15,6 @@
 
 namespace {
 using ov::npuw::LLMInferRequest;
-
-std::string shape_to_string(const ov::Shape& shape) {
-    std::stringstream ss;
-    ss << "[";
-    for (size_t i = 0; i < shape.size(); ++i) {
-        if (i > 0) {
-            ss << ",";
-        }
-        ss << shape[i];
-    }
-    ss << "]";
-    return ss.str();
-}
-
-void append_llm_dump(const std::string& line) {
-    std::ofstream dump("C:\\Users\\Shunta Saito\\Desktop\\npu-exp\\models\\npuw_link_dump.txt", std::ios::app);
-    if (!dump.is_open()) {
-        return;
-    }
-    dump << line << std::endl;
-}
 
 void copy_columns_by_row_chunks_2d(ov::SoPtr<ov::ITensor> src, ov::SoPtr<ov::ITensor>& dst) {
     const auto& src_shape = src->get_shape();
@@ -143,7 +119,6 @@ void ov::npuw::LLMInferRequest::init_lora_states() {
 
 ov::npuw::LLMInferRequest::LLMInferRequest(const std::shared_ptr<ov::npuw::LLMCompiledModel>& compiled_model)
     : ov::npuw::LLMInferBaseRequest(compiled_model) {
-    std::cerr << "[LLM_IR_CTOR] begin" << std::endl;
     init_ports();
 
     auto input_ids_port =
@@ -158,15 +133,10 @@ ov::npuw::LLMInferRequest::LLMInferRequest(const std::shared_ptr<ov::npuw::LLMCo
     }
 
     // Create and initialize generate request variants with memory sharing
-    std::cerr << "[LLM_IR_CTOR] before create_generate_request_variants" << std::endl;
     create_generate_request_variants(compiled_model);
-    std::cerr << "[LLM_IR_CTOR] after create_generate_request_variants" << std::endl;
 
-    std::cerr << "[LLM_IR_CTOR] before create_base_infer_request(prefill)" << std::endl;
     m_prefill_base_request = compiled_model->m_prefill_compiled->create_base_infer_request();
-    std::cerr << "[LLM_IR_CTOR] after create_base_infer_request(prefill)" << std::endl;
     m_prefill_request = compiled_model->m_prefill_compiled->wrap_async_infer_request(m_prefill_base_request);
-    std::cerr << "[LLM_IR_CTOR] after wrap_async_infer_request(prefill)" << std::endl;
 
     for (const auto& input_port : m_prefill_request->get_compiled_model()->inputs()) {
         m_prefill_in_ports.emplace(input_port.get_any_name(), input_port);
@@ -250,7 +220,6 @@ ov::npuw::LLMInferRequest::LLMInferRequest(const std::shared_ptr<ov::npuw::LLMCo
     }
 
     m_generate_initialized = false;
-    std::cerr << "[LLM_IR_CTOR] end" << std::endl;
 }
 
 std::string ov::npuw::LLMInferRequest::init_pre_alloc_device() {
@@ -302,15 +271,11 @@ void ov::npuw::LLMInferRequest::bind_past_kv() {
 
 void ov::npuw::LLMInferRequest::create_generate_request_variants(
     const std::shared_ptr<ov::npuw::LLMCompiledModel>& compiled_model) {
-    std::cerr << "[CREATE_GEN_VARIANTS] begin count=" << compiled_model->m_generate_compiled_variants.size() << std::endl;
     // Create multiple generate model variants' requests
     m_generate_requests.reserve(compiled_model->m_generate_compiled_variants.size());
 
     // First, create the largest variant request (last one in the list)
-    std::cerr << "[CREATE_GEN_VARIANTS] before largest create_infer_request idx="
-              << (compiled_model->m_generate_compiled_variants.size() - 1) << std::endl;
     auto largest_generate_request = compiled_model->m_generate_compiled_variants.back()->create_infer_request();
-    std::cerr << "[CREATE_GEN_VARIANTS] after largest create_infer_request" << std::endl;
 
     // Store past KV tensors from the largest variant for sharing
     std::unordered_map<std::string, ov::SoPtr<ov::ITensor>> largest_past_kv_tensors;
@@ -330,9 +295,7 @@ void ov::npuw::LLMInferRequest::create_generate_request_variants(
             generate_request = largest_generate_request;
         } else {
             // Create smaller variant
-            std::cerr << "[CREATE_GEN_VARIANTS] before small create_infer_request idx=" << i << std::endl;
             generate_request = compiled_model->m_generate_compiled_variants[i]->create_infer_request();
-            std::cerr << "[CREATE_GEN_VARIANTS] after small create_infer_request idx=" << i << std::endl;
 
             // Share past KV tensors from the largest variant
             for (const auto& input_port : generate_request->get_compiled_model()->inputs()) {
@@ -356,7 +319,6 @@ void ov::npuw::LLMInferRequest::create_generate_request_variants(
         }
 
         m_generate_requests.push_back(generate_request);
-        std::cerr << "[CREATE_GEN_VARIANTS] pushed idx=" << i << std::endl;
 
         // Build input/output ports mapping for this variant
         std::unordered_map<std::string, ov::Output<const ov::Node>> variant_in_ports;
@@ -366,15 +328,11 @@ void ov::npuw::LLMInferRequest::create_generate_request_variants(
             variant_in_ports.emplace(input_port.get_any_name(), input_port);
             LOG_DEBUG("GenerateVariant[" << i << "] input " << input_port.get_any_name() << " "
                                         << input_port.get_partial_shape());
-            append_llm_dump("GenerateVariant[" + std::to_string(i) + "] input " +
-                            input_port.get_any_name() + " " + input_port.get_partial_shape().to_string());
         }
         for (const auto& output_port : generate_request->get_compiled_model()->outputs()) {
             variant_out_ports.emplace(output_port.get_any_name(), output_port);
             LOG_DEBUG("GenerateVariant[" << i << "] output " << output_port.get_any_name() << " "
                                          << output_port.get_partial_shape());
-            append_llm_dump("GenerateVariant[" + std::to_string(i) + "] output " +
-                            output_port.get_any_name() + " " + output_port.get_partial_shape().to_string());
         }
 
         m_generate_variant_in_ports.emplace(generate_request, std::move(variant_in_ports));
@@ -383,17 +341,11 @@ void ov::npuw::LLMInferRequest::create_generate_request_variants(
 
     // Set default to the largest variant for backward compatibility
     m_kvcache_request = m_generate_requests.back();
-    std::cerr << "[CREATE_GEN_VARIANTS] after default request select" << std::endl;
 
     // Cache selected generate ports here. Prefill ports are initialized later in the constructor
     // after m_prefill_request is created.
-    std::cerr << "[CREATE_GEN_VARIANTS] before cache selected in ports" << std::endl;
     m_kvcache_in_ports = m_generate_variant_in_ports.at(m_kvcache_request);
-    std::cerr << "[CREATE_GEN_VARIANTS] after cache selected in ports" << std::endl;
-    std::cerr << "[CREATE_GEN_VARIANTS] before cache selected out ports" << std::endl;
     m_kvcache_out_ports = m_generate_variant_out_ports.at(m_kvcache_request);
-    std::cerr << "[CREATE_GEN_VARIANTS] after cache selected out ports" << std::endl;
-    std::cerr << "[CREATE_GEN_VARIANTS] end" << std::endl;
 }
 
 std::shared_ptr<ov::IAsyncInferRequest> ov::npuw::LLMInferRequest::select_generate_request(int64_t prompt_length) {
@@ -570,22 +522,11 @@ void ov::npuw::LLMInferRequest::copy_kvcache() {
         const auto& pre_kv_dim = kv_dim(kvcache_desc.v_tensors_transposed_pre);
         const auto& gen_kv_dim = kv_dim(kvcache_desc.v_tensors_transposed_gen);
         auto kvcache_in_tensor = m_kvcache_request->get_tensor(m_kvcache_in_ports.at(input_name));
-        if (output_name.find("present.0.") != std::string::npos || output_name.find("present.1.") != std::string::npos) {
-            std::cerr << "[COPY_KVCACHE] " << output_name << " -> " << input_name
-                      << " prefill_shape=" << prefill_out_tensor->get_shape()
-                      << " generate_shape=" << kvcache_in_tensor->get_shape() << std::endl;
-        }
         LOG_DEBUG("copy_kvcache map " << output_name << " -> " << input_name
                                       << " prefill_shape=" << prefill_out_tensor->get_shape()
                                       << " generate_shape=" << kvcache_in_tensor->get_shape());
-        append_llm_dump("copy_kvcache map " + output_name + " -> " + input_name +
-                        " prefill_shape=" + shape_to_string(prefill_out_tensor->get_shape()) +
-                        " generate_shape=" + shape_to_string(kvcache_in_tensor->get_shape()));
 
         if (is_plamo2_mamba_state_tensor(prefill_out_tensor) && is_plamo2_mamba_state_tensor(kvcache_in_tensor)) {
-            std::cerr << "[COPY_KVCACHE] mamba_direct_copy " << output_name
-                      << " prefill_shape=" << prefill_out_tensor->get_shape()
-                      << " generate_shape=" << kvcache_in_tensor->get_shape() << std::endl;
             if (prefill_out_tensor->get_shape() == kvcache_in_tensor->get_shape()) {
                 prefill_out_tensor->copy_to(kvcache_in_tensor._ptr);
             } else {
@@ -878,10 +819,6 @@ void ov::npuw::LLMInferRequest::infer_whole_prefill(ov::SoPtr<ov::ITensor> input
                                                     ov::SoPtr<ov::ITensor> token_type_ids) {
     LOG_DEBUG("Calling inference for prefill model in a single launch.");
     LOG_BLOCK();
-    std::cerr << "[LLM_PREFILL_WHOLE] begin"
-              << " input_ids_shape=" << input_ids->get_shape()
-              << " attention_mask_shape=" << attention_mask->get_shape()
-              << " position_ids_shape=" << position_ids->get_shape() << std::endl;
 
     // NB: padded_input can be either fp32(VLM) or i64(LLM)
     auto padded_input = m_prefill_request->get_tensor(m_prefill_in_ports.at(m_input_ids_name));
@@ -922,13 +859,10 @@ void ov::npuw::LLMInferRequest::infer_whole_prefill(ov::SoPtr<ov::ITensor> input
         m_eagle3_ext.prepare_inputs(m_prefill_request, m_prefill_in_ports);
     }
 
-    std::cerr << "[LLM_PREFILL_WHOLE] before_prefill_infer" << std::endl;
     m_prefill_request->infer();
-    std::cerr << "[LLM_PREFILL_WHOLE] after_prefill_infer" << std::endl;
     auto& kvcache_desc = m_npuw_llm_compiled_model->m_kvcache_desc;
     kvcache_desc.num_stored_tokens += static_cast<uint32_t>(input_ids->get_shape()[layer_ids::INPUT_IDS_SEQ_LEN_DIM]);
 
-    std::cerr << "[LLM_PREFILL_WHOLE] end num_stored_tokens=" << kvcache_desc.num_stored_tokens << std::endl;
     LOG_DEBUG("Done");
 }
 
@@ -938,10 +872,6 @@ void ov::npuw::LLMInferRequest::infer_prefill(ov::SoPtr<ov::ITensor> input_ids,
                                               ov::SoPtr<ov::ITensor> token_type_ids) {
     LOG_DEBUG("Calling inference for prefill model...");
     LOG_BLOCK();
-    std::cerr << "[LLM_PREFILL] begin"
-              << " input_ids_shape=" << input_ids->get_shape()
-              << " attention_mask_shape=" << attention_mask->get_shape()
-              << " position_ids_shape=" << position_ids->get_shape() << std::endl;
 
     const auto prompt_length = input_ids->get_shape()[layer_ids::INPUT_IDS_SEQ_LEN_DIM];
     auto& kvcache_desc = m_npuw_llm_compiled_model->m_kvcache_desc;
@@ -956,8 +886,6 @@ void ov::npuw::LLMInferRequest::infer_prefill(ov::SoPtr<ov::ITensor> input_ids,
 
     process_longrope(m_prefill_request, m_prefill_in_ports, position_ids);
     const bool use_chunk_prefill = m_npuw_llm_compiled_model->m_use_chunk_prefill;
-    std::cerr << "[LLM_PREFILL] use_chunk_prefill=" << use_chunk_prefill
-              << " prompt_length=" << prompt_length << std::endl;
     if (use_chunk_prefill) {
         OPENVINO_ASSERT(!token_type_ids,
                         "Chunking is not implemented for Gemma model family yet. "
@@ -969,9 +897,7 @@ void ov::npuw::LLMInferRequest::infer_prefill(ov::SoPtr<ov::ITensor> input_ids,
 
     if (m_lm_head_request) {
         LOG_DEBUG("Calling inference for LM head model.");
-        std::cerr << "[LLM_PREFILL] before_lm_head_infer" << std::endl;
         m_lm_head_request->infer();
-        std::cerr << "[LLM_PREFILL] after_lm_head_infer" << std::endl;
         auto padded_logits = m_lm_head_request->get_tensor(m_lm_head_logits_port);
         auto logits_seq_len = static_cast<uint32_t>(padded_logits->get_shape()[1]);
         auto useful_seq_len = std::min(kvcache_desc.num_stored_tokens, logits_seq_len);
@@ -999,7 +925,6 @@ void ov::npuw::LLMInferRequest::infer_prefill(ov::SoPtr<ov::ITensor> input_ids,
 
     m_generate_initialized = false;
 
-    std::cerr << "[LLM_PREFILL] end num_stored_tokens=" << kvcache_desc.num_stored_tokens << std::endl;
     LOG_DEBUG("Done");
 }
 
@@ -1009,10 +934,6 @@ void ov::npuw::LLMInferRequest::infer_generate(ov::SoPtr<ov::ITensor> input_ids,
                                                ov::SoPtr<ov::ITensor> token_type_ids) {
     LOG_DEBUG("Calling inference for generate model...");
     LOG_BLOCK();
-    std::cerr << "[LLM_GENERATE] begin"
-              << " input_ids_shape=" << input_ids->get_shape()
-              << " attention_mask_shape=" << attention_mask->get_shape()
-              << " position_ids_shape=" << position_ids->get_shape() << std::endl;
     auto& kvcache_desc = m_npuw_llm_compiled_model->m_kvcache_desc;
     uint32_t input_tokens_len = static_cast<uint32_t>(input_ids->get_shape()[layer_ids::INPUT_IDS_SEQ_LEN_DIM]);
     if (input_tokens_len > kvcache_desc.max_generation_token_len) {
@@ -1026,8 +947,6 @@ void ov::npuw::LLMInferRequest::infer_generate(ov::SoPtr<ov::ITensor> input_ids,
 
     if (!m_generate_initialized) {
         LOG_DEBUG("Copy kv-cache from prefill to generate model.");
-        std::cerr << "[LLM_GENERATE] initializing_generate_request"
-                  << " num_stored_tokens=" << kvcache_desc.num_stored_tokens << std::endl;
         if (kvcache_desc.num_stored_tokens > 0) {
             copy_kvcache();
         }
@@ -1090,14 +1009,11 @@ void ov::npuw::LLMInferRequest::infer_generate(ov::SoPtr<ov::ITensor> input_ids,
         m_eagle3_ext.prepare_inputs(m_kvcache_request, m_kvcache_in_ports);
     }
 
-    std::cerr << "[LLM_GENERATE] before_kvcache_infer" << std::endl;
     m_kvcache_request->infer();
-    std::cerr << "[LLM_GENERATE] after_kvcache_infer" << std::endl;
     kvcache_desc.num_stored_tokens += input_tokens_len;
 
     if (m_lm_head_request) {
         LOG_DEBUG("Calling inference for LM head model asynchronously");
-        std::cerr << "[LLM_GENERATE] before_lm_head_start_async" << std::endl;
         m_lm_head_request->start_async();
         if (kvcache_desc.num_stored_tokens < kvcache_desc.total_size) {
             update_kvcache_for(m_kvcache_request,
@@ -1106,9 +1022,7 @@ void ov::npuw::LLMInferRequest::infer_generate(ov::SoPtr<ov::ITensor> input_ids,
                                input_tokens_len,
                                kvcache_desc.v_tensors_transposed_gen);
         }
-        std::cerr << "[LLM_GENERATE] before_lm_head_wait" << std::endl;
         m_lm_head_request->wait();
-        std::cerr << "[LLM_GENERATE] after_lm_head_wait" << std::endl;
         LOG_DEBUG("Calling inference for LM head model -- done.");
 
         m_logits = m_lm_head_request->get_tensor(m_lm_head_logits_port);
@@ -1128,13 +1042,11 @@ void ov::npuw::LLMInferRequest::infer_generate(ov::SoPtr<ov::ITensor> input_ids,
         m_eagle3_ext.update_last_hidden_state(m_kvcache_request, m_kvcache_out_ports);
     }
 
-    std::cerr << "[LLM_GENERATE] end num_stored_tokens=" << kvcache_desc.num_stored_tokens << std::endl;
     LOG_DEBUG("Done");
 }
 
 void ov::npuw::LLMInferRequest::infer() {
     const auto& inputs = get_inputs();
-    std::cerr << "[LLM_INFER] begin" << std::endl;
 
     auto input_ids = get_tensor(ov::npuw::util::find_port_by_name(inputs, m_input_ids_name).value());
     auto attention_mask = get_tensor(ov::npuw::util::find_port_by_name(inputs, layer_names::attention_mask).value());
@@ -1191,10 +1103,6 @@ void ov::npuw::LLMInferRequest::infer() {
     //    both main and draft models for most of LLMs.
     if (input_ids->get_shape()[layer_ids::INPUT_IDS_SEQ_LEN_DIM] > 1 &&
         position_ids->data<int64_t>()[0] == m_first_position_id) {
-        std::cerr << "[LLM_INFER] branch=prefill"
-                  << " seq_len=" << input_ids->get_shape()[layer_ids::INPUT_IDS_SEQ_LEN_DIM]
-                  << " first_pos=" << position_ids->data<int64_t>()[0]
-                  << " first_position_id=" << m_first_position_id << std::endl;
         infer_prefill(input_ids, attention_mask, position_ids, token_type_ids);
     } else {
         // FIXME: Need to make the solution smarter.
@@ -1204,13 +1112,8 @@ void ov::npuw::LLMInferRequest::infer() {
         if (position_ids->get_shape().size() < 3) {
             trim_kvcache_for_speculative_decoding(position_ids);
         }
-        std::cerr << "[LLM_INFER] branch=generate"
-                  << " seq_len=" << input_ids->get_shape()[layer_ids::INPUT_IDS_SEQ_LEN_DIM]
-                  << " first_pos=" << position_ids->data<int64_t>()[0]
-                  << " first_position_id=" << m_first_position_id << std::endl;
         infer_generate(input_ids, attention_mask, position_ids, token_type_ids);
     }
-    std::cerr << "[LLM_INFER] end" << std::endl;
 }
 
 ov::SoPtr<ov::ITensor> ov::npuw::LLMInferRequest::get_tensor(const ov::Output<const ov::Node>& port) const {

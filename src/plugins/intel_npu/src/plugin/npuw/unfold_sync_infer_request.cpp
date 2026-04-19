@@ -10,7 +10,6 @@
 
 ov::npuw::UnfoldInferRequest::UnfoldInferRequest(const std::shared_ptr<ov::npuw::CompiledModel>& compiled_model)
     : ov::npuw::IBaseInferRequest(compiled_model) {
-    std::cerr << "[UNFOLD_CTOR] begin" << std::endl;
     // Create infer requests
     // Preallocate funcall tensors & substitute function call requests
     for (std::size_t i = 0; i < m_num_submodels; i++) {
@@ -45,7 +44,6 @@ ov::npuw::UnfoldInferRequest::UnfoldInferRequest(const std::shared_ptr<ov::npuw:
     }  // for(submodels)
 
     alloc_quant_gather();
-    std::cerr << "[UNFOLD_CTOR] before connect_subrequests" << std::endl;
 
     LOG_INFO("Connecting subrequests...");
     LOG_BLOCK();
@@ -68,14 +66,10 @@ ov::npuw::UnfoldInferRequest::UnfoldInferRequest(const std::shared_ptr<ov::npuw:
         m_subrequests[subm_idx_to]->set_tensor(iport, tensor);
     }  // for(map)
     LOG_INFO("Done");
-    std::cerr << "[UNFOLD_CTOR] after connect_subrequests" << std::endl;
 
-    std::cerr << "[UNFOLD_CTOR] before init_gio" << std::endl;
     init_gio();
-    std::cerr << "[UNFOLD_CTOR] after init_gio" << std::endl;
 
     for (size_t i = 0; i < m_num_submodels; i++) {
-        std::cerr << "[UNFOLD_CTOR] preemptive_set begin subgraph=" << i << std::endl;
         LOG_VERB("Trying to preemptively set tensors for Subgraph[" << i << "]...");
         LOG_BLOCK();
         auto& comp_model_desc = m_npuw_model->m_compiled_submodels[i];
@@ -86,9 +80,7 @@ ov::npuw::UnfoldInferRequest::UnfoldInferRequest(const std::shared_ptr<ov::npuw:
             unpack_closure(i, m_subrequests[i]);
         }
         LOG_VERB("Done");
-        std::cerr << "[UNFOLD_CTOR] preemptive_set end subgraph=" << i << std::endl;
     }
-    std::cerr << "[UNFOLD_CTOR] end" << std::endl;
 }
 
 bool ov::npuw::UnfoldInferRequest::valid_subrequest(std::size_t idx) const {

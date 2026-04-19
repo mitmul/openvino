@@ -454,35 +454,11 @@ void ov::npuw::IBaseInferRequest::unpack_closure(std::size_t idx, RqPtr request)
                 closure_copy_required.push_back(cidx);
             } else {
                 // Easy case, just set one to another
-                std::cerr << "[UNPACK_CLOSURE_SET] before"
-                          << " subgraph=" << idx
-                          << " real_subgraph=" << real_idx
-                          << " closure_idx=" << cidx
-                          << " closure_param_id=" << closure_param_id
-                          << " port=" << iport.get_any_name()
-                          << " closure_type=" << closure.get_element_type()
-                          << " closure_shape=" << closure.get_shape()
-                          << " closure_data=" << closure.data()
-                          << " port_type=" << iport.get_element_type()
-                          << " port_shape=" << iport.get_partial_shape()
-                          << std::endl;
                 request->set_tensor(iport, ov::get_tensor_impl(closure));
-                std::cerr << "[UNPACK_CLOSURE_SET] after"
-                          << " subgraph=" << idx
-                          << " real_subgraph=" << real_idx
-                          << " closure_idx=" << cidx
-                          << " port=" << iport.get_any_name()
-                          << std::endl;
             }
         }
     }  // for(closure)
 
-    std::cerr << "[UNPACK_CLOSURE] before_copy_phase"
-              << " subgraph=" << idx
-              << " real_subgraph=" << real_idx
-              << " copy_count=" << closure_copy_required.size()
-              << " unpack_count=" << closure_unpack_required.size()
-              << std::endl;
     // m_ms_unpack += ov::npuw::perf::ms_to_run([&](){
     ov::parallel_for(closure_copy_required.size(), [&](std::size_t j) {
         auto cidx = closure_copy_required[j];
@@ -490,35 +466,10 @@ void ov::npuw::IBaseInferRequest::unpack_closure(std::size_t idx, RqPtr request)
         const auto closure_param_id = comp_model_desc.param_base + cidx;
         auto& iport = func_desc.compiled_model->inputs()[closure_param_id];
         auto clparam = request->get_tensor(iport);
-        std::cerr << "[UNPACK_CLOSURE_COPY] before"
-                  << " subgraph=" << idx
-                  << " real_subgraph=" << real_idx
-                  << " closure_idx=" << cidx
-                  << " port=" << iport.get_any_name()
-                  << " closure_type=" << closure.get_element_type()
-                  << " closure_shape=" << closure.get_shape()
-                  << " dst_type=" << clparam->get_element_type()
-                  << " dst_shape=" << clparam->get_shape()
-                  << std::endl;
         ov::get_tensor_impl(closure)->copy_to(clparam._ptr);
-        std::cerr << "[UNPACK_CLOSURE_COPY] after"
-                  << " subgraph=" << idx
-                  << " real_subgraph=" << real_idx
-                  << " closure_idx=" << cidx
-                  << " port=" << iport.get_any_name()
-                  << std::endl;
     });
-    std::cerr << "[UNPACK_CLOSURE] after_copy_phase"
-              << " subgraph=" << idx
-              << " real_subgraph=" << real_idx
-              << std::endl;
     // }); // ms_to_run
 
-    std::cerr << "[UNPACK_CLOSURE] before_unpack_phase"
-              << " subgraph=" << idx
-              << " real_subgraph=" << real_idx
-              << " unpack_count=" << closure_unpack_required.size()
-              << std::endl;
     for (std::size_t j = 0; j != closure_unpack_required.size(); j++) {
         // NB: No need to protect anything here as containers are all
         // preallocated and we only access elements under particular (thread
@@ -564,10 +515,6 @@ void ov::npuw::IBaseInferRequest::unpack_closure(std::size_t idx, RqPtr request)
             ov::npuw::util::unpack(ov::get_tensor_impl(closure), clparam);
         }
     }
-    std::cerr << "[UNPACK_CLOSURE] end"
-              << " subgraph=" << idx
-              << " real_subgraph=" << real_idx
-              << std::endl;
 }
 
 void ov::npuw::IBaseInferRequest::bind_global_params(std::size_t idx, RqPtr request) {
@@ -677,25 +624,7 @@ void ov::npuw::IBaseInferRequest::bind_global_params(std::size_t idx, RqPtr requ
                 copy_list.emplace_back(g_tnsr, s_port);
             } else {
                 LOG_DEBUG("Will be set");
-                std::cerr << "[BIND_GLOBAL] before"
-                          << " subgraph=" << idx
-                          << " real_subgraph=" << real_idx
-                          << " global_param_idx=" << param_idx
-                          << " sub_input_idx=" << sub_in_idx
-                          << " src_type=" << g_tnsr->get_element_type()
-                          << " src_shape=" << g_tnsr->get_shape()
-                          << " dst_name=" << s_port.get_any_name()
-                          << " dst_type=" << s_port.get_element_type()
-                          << " dst_shape=" << s_port.get_partial_shape()
-                          << std::endl;
                 request->set_tensor(s_port, g_tnsr);
-                std::cerr << "[BIND_GLOBAL] after"
-                          << " subgraph=" << idx
-                          << " real_subgraph=" << real_idx
-                          << " global_param_idx=" << param_idx
-                          << " sub_input_idx=" << sub_in_idx
-                          << " dst_name=" << s_port.get_any_name()
-                          << std::endl;
             }
         }
     }  // for(global_params)

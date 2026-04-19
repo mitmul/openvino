@@ -38,11 +38,6 @@ void ov::npuw::LLMInferBaseRequest::update_kvcache_for(
         auto src_tensor = request->get_tensor(out_ports.at(output_name));
 
         if (is_plamo2_mamba_state_tensor(src_tensor) && is_plamo2_mamba_state_tensor(dst_tensor)) {
-            if (output_name.find("present.0.") != std::string::npos || output_name.find("present.1.") != std::string::npos) {
-                std::cerr << "[UPDATE_KVCACHE] mamba_direct_copy " << output_name
-                          << " src_shape=" << src_tensor->get_shape()
-                          << " dst_shape=" << dst_tensor->get_shape() << std::endl;
-            }
             if (src_tensor->get_shape() == dst_tensor->get_shape()) {
                 src_tensor->copy_to(dst_tensor._ptr);
             } else {

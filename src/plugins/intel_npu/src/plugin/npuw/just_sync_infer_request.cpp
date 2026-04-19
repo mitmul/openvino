@@ -434,15 +434,10 @@ ov::npuw::JustInferRequest::JustInferRequest(const std::shared_ptr<ov::npuw::Com
     }  // if(function_pipelining)
 
     alloc_quant_gather();
-    std::cerr << "[JUST_CTOR] before connect_subrequests" << std::endl;
     connect_subrequests();
-    std::cerr << "[JUST_CTOR] after connect_subrequests" << std::endl;
-    std::cerr << "[JUST_CTOR] before init_gio" << std::endl;
     init_gio();
-    std::cerr << "[JUST_CTOR] after init_gio" << std::endl;
 
     for (size_t i = 0; i < m_num_submodels; i++) {
-        std::cerr << "[JUST_CTOR] preemptive_set begin subgraph=" << i << std::endl;
         LOG_VERB("Trying to preemptively set tensors for Subgraph[" << i << "]...");
         LOG_BLOCK();
         auto& comp_model_desc = m_npuw_model->m_compiled_submodels[i];
@@ -460,7 +455,6 @@ ov::npuw::JustInferRequest::JustInferRequest(const std::shared_ptr<ov::npuw::Com
             unpack_closure(i, m_subrequests[real_idx]);
         }
         LOG_VERB("Done");
-        std::cerr << "[JUST_CTOR] preemptive_set end subgraph=" << i << std::endl;
     }
 
     // Handle spatial dynamic submission
@@ -627,27 +621,10 @@ void ov::npuw::JustInferRequest::connect_subrequests() {
             const auto& iport = subreqs[subm_idx_to]->get_compiled_model()->inputs()[port_idx_to];
             const auto& oport = subreqs[subm_idx_from]->get_compiled_model()->outputs()[port_idx_from];
             const auto& tensor = subreqs[subm_idx_from]->get_tensor(oport);
-            std::cerr << "[CONNECT_SUBREQ] before"
-                      << " from_subgraph=" << subm_idx_from
-                      << " from_port=" << port_idx_from
-                      << " to_subgraph=" << subm_idx_to
-                      << " to_port=" << port_idx_to
-                      << " tensor_type=" << tensor->get_element_type()
-                      << " tensor_shape=" << tensor->get_shape()
-                      << " dst_name=" << iport.get_any_name()
-                      << " dst_type=" << iport.get_element_type()
-                      << " dst_shape=" << iport.get_partial_shape()
-                      << std::endl;
             LOG_DEBUG("Set Subgraph[" << subm_idx_to << "]/" << iport << " shape=" << iport.get_partial_shape()
                                       << " to Subgraph[" << subm_idx_from << "]/" << oport
                                       << " tensor_shape=" << tensor->get_shape());
             subreqs[subm_idx_to]->set_tensor(iport, tensor);
-            std::cerr << "[CONNECT_SUBREQ] after"
-                      << " from_subgraph=" << subm_idx_from
-                      << " from_port=" << port_idx_from
-                      << " to_subgraph=" << subm_idx_to
-                      << " to_port=" << port_idx_to
-                      << std::endl;
         }
     }  // for(map)
     LOG_INFO("Done");
