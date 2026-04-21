@@ -4,7 +4,10 @@
 
 #pragma once
 
+#include <limits>
+#include <map>
 #include <memory>
+#include <string_view>
 
 #include "base_sync_infer_request.hpp"
 #include "llm_compiled_model.hpp"
@@ -13,6 +16,7 @@
 #include "llm_lora_states.hpp"
 #include "llm_prefix_caching.hpp"
 #include "openvino/core/descriptor/output.hpp"
+#include "perf.hpp"
 
 namespace ov {
 namespace npuw {
@@ -20,13 +24,24 @@ namespace npuw {
 class LLMInferRequest : public ov::npuw::LLMInferBaseRequest {
 public:
     explicit LLMInferRequest(const std::shared_ptr<ov::npuw::LLMCompiledModel>& compiled_model);
+    ~LLMInferRequest() override;
 
     void infer() override;
+    std::vector<ov::ProfilingInfo> get_profiling_info() const override;
 
     ov::SoPtr<ov::ITensor> get_tensor(const ov::Output<const ov::Node>& port) const override;
     std::vector<ov::SoPtr<ov::IVariableState>> query_state() const override;
 
 protected:
+    struct OpProfileSummary {
+        uint64_t total_us = 0;
+        uint64_t min_us = std::numeric_limits<uint64_t>::max();
+        uint64_t max_us = 0;
+        std::size_t records = 0;
+        std::string exec_type;
+        std::string node_type;
+    };
+
     virtual void prepare_for_new_conversation();
     void prepare_for_new_conversation(int64_t prompt_length);
     void apply_lora();
@@ -61,6 +76,8 @@ protected:
                         ov::SoPtr<ov::ITensor> attention_mask,
                         ov::SoPtr<ov::ITensor> position_ids,
                         ov::SoPtr<ov::ITensor> input_token_ids);
+    void collect_stage_profiling(std::string_view stage_name, const std::shared_ptr<ov::IAsyncInferRequest>& request);
+    void print_stage_profiling_summary(std::string_view stage_name, const std::map<std::string, OpProfileSummary>& profile) const;
 
     // Multiple generate inference request variants, each with a different KV cache size
     std::vector<std::shared_ptr<ov::IAsyncInferRequest>> m_generate_requests;
@@ -122,6 +139,13 @@ protected:
 
     // Support prefix caching
     std::unique_ptr<PrefixCachingHelper> m_prefix_caching_helper;
+
+    using MS = ov::npuw::perf::metric<ov::npuw::perf::MSec>;
+    ov::npuw::perf::Profile<MS> m_llm_profile;
+    bool m_report_op_profiling = false;
+    mutable std::mutex m_op_profile_mutex;
+    std::map<std::string, OpProfileSummary> m_prefill_op_profile;
+    std::map<std::string, OpProfileSummary> m_generate_op_profile;
 
     // Friend declarations for PrefixCachingHelper to access protected members
     friend class PrefixCachingHelper;

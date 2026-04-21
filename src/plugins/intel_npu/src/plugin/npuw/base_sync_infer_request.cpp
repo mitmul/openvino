@@ -292,22 +292,35 @@ std::string ov::npuw::IBaseInferRequest::profile_tag(std::size_t idx) const {
 
 void ov::npuw::IBaseInferRequest::infer() {
     m_now_idx.reset();
-    prepare_for_infer();
+    record_profile_metric("infer/prepare_for_infer", [&]() {
+        prepare_for_infer();
+    });
     bool failover_happened = false;
     for (std::size_t idx = 0u; idx < m_num_submodels; idx++) {
         m_now_idx = idx;
         if (!valid_subrequest(idx)) {
             continue;
         }
-        subscribe_subrequest(idx, [](std::exception_ptr) {});
+        record_profile_metric("infer/subscribe_subrequest", [&]() {
+            subscribe_subrequest(idx, [](std::exception_ptr) {});
+        });
         bool failover = false;
-        m_profile[profile_tag(idx)].record([&]() {
-            run_subrequest_for_success(idx, failover);
+        const std::string subgraph_tag = "infer/subgraph_" + std::to_string(idx);
+        record_profile_metric("infer/run_subrequest_for_success", [&]() {
+            record_profile_metric(subgraph_tag, [&]() {
+                m_profile[profile_tag(idx)].record([&]() {
+                    run_subrequest_for_success(idx, failover);
+                });
+            });
         });
         failover_happened |= failover;
-        complete_subrequest(idx);
+        record_profile_metric("infer/complete_subrequest", [&]() {
+            complete_subrequest(idx);
+        });
         if (m_npuw_model->m_acc_check) {
-            ensure_subrequest_is_accurate(idx, failover);
+            record_profile_metric("infer/accuracy_check", [&]() {
+                ensure_subrequest_is_accurate(idx, failover);
+            });
             failover_happened |= failover;
         }
     }

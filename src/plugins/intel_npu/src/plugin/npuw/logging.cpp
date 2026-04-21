@@ -12,7 +12,6 @@
 #include "openvino/runtime/make_tensor.hpp"  // get_tensor_impl
 
 namespace {
-#ifdef NPU_PLUGIN_DEVELOPER_BUILD
 const char* get_env(const std::vector<std::string>& list_to_try) {
     for (auto&& key : list_to_try) {
         const char* pstr = std::getenv(key.c_str());
@@ -21,7 +20,6 @@ const char* get_env(const std::vector<std::string>& list_to_try) {
     }
     return nullptr;
 }
-#endif
 }  // anonymous namespace
 
 ov::npuw::LogLevel ov::npuw::get_log_level() {
@@ -68,7 +66,6 @@ bool ov::npuw::debug_groups() {
 
 bool ov::npuw::profiling_enabled() {
     static bool do_profiling = false;
-#ifdef NPU_PLUGIN_DEVELOPER_BUILD
     static std::once_flag flag;
 
     std::call_once(flag, []() {
@@ -79,7 +76,6 @@ bool ov::npuw::profiling_enabled() {
         const std::string prof_str(prof_opt);
         do_profiling = (prof_str == "YES" || prof_str == "ON" || prof_str == "1");
     });
-#endif
     return do_profiling;
 }
 

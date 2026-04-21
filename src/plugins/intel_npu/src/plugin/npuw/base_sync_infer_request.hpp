@@ -210,9 +210,17 @@ protected:
     using MS = ov::npuw::perf::metric<ov::npuw::perf::MSec>;
     using B = ov::npuw::perf::counter<ov::npuw::perf::Bytes>;
 
+    template <typename F>
+    void record_profile_metric(const std::string& tag, F&& f) {
+        auto sample = ov::npuw::perf::MSec::sample(std::forward<F>(f));
+        std::lock_guard lock(m_profile_mutex);
+        m_profile[tag] += std::move(sample);
+    }
+
     MS m_ms_unpack;
     ov::npuw::perf::Profile<MS> m_profile;
     mutable ov::npuw::perf::Profile<B> m_footprint;  // mutable due to lazy I/O allocation in get_tensor()
+    mutable std::mutex m_profile_mutex;
 
     std::string profile_tag(std::size_t idx) const;
 

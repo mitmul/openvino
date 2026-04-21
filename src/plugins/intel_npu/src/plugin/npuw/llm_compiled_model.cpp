@@ -873,6 +873,27 @@ bool is_aligned_to(uint32_t value, uint32_t alignment) {
 
 std::shared_ptr<ov::Model> cvt_kvcache_to_low_precision(const std::shared_ptr<ov::Model>& model,
                                                         const ov::element::Type lptype) {
+    auto is_plamo2_mamba_external_state = [](const ov::Output<const ov::Node>& tensor) {
+        const auto& name = tensor.get_any_name();
+        if (name.find("past_key_values.") == std::string::npos && name.find("present.") == std::string::npos) {
+            return false;
+        }
+        const auto& pshape = tensor.get_partial_shape();
+        if (pshape.size() != 4u) {
+            return false;
+        }
+        return pshape[1].is_static() && pshape[1].get_length() == 1 && pshape[3].is_static() &&
+               pshape[3].get_length() > 1024;
+    };
+
+    for (const auto& tensor : model->inputs()) {
+        if (is_plamo2_mamba_external_state(tensor)) {
+            LOG_INFO("Skip KV-cache low precision conversion for model " << model->get_name()
+                                                                         << " because PLaMo2 Mamba external state is present");
+            return model->clone();
+        }
+    }
+
     ov::preprocess::PrePostProcessor ppp(model);
 
     for (const auto& tensor : model->inputs()) {
@@ -1069,25 +1090,27 @@ std::shared_ptr<ov::Model> cut_lm_head(std::shared_ptr<ov::Model>& model) {
     return lm_head_model;
 }
 
+bool is_plamo2_mamba_external_state(const ov::Output<const ov::Node>& port) {
+    const auto& name = port.get_any_name();
+    if (name.find("past_key_values.") == std::string::npos && name.find("present.") == std::string::npos) {
+        return false;
+    }
+
+    const auto& pshape = port.get_partial_shape();
+    if (pshape.size() != 4u) {
+        return false;
+    }
+
+    return pshape[1].is_static() && pshape[1].get_length() == 1 && pshape[3].is_static() &&
+           pshape[3].get_length() > 1024;
+}
+
 void reshape_to_static(std::shared_ptr<ov::Model> model,
                        const uint32_t input_size,
                        const uint32_t kvcache_size,
                        const KVAxesPosition& kv_axes_position,
                        const uint32_t lora_rank,
                        const uint32_t lhs_seq_size = 0) {
-    auto is_plamo2_mamba_external_state = [](const ov::Output<const ov::Node>& input) {
-        const auto& input_name = input.get_any_name();
-        if (input_name.find("past_key_values.") == std::string::npos) {
-            return false;
-        }
-        const auto& pshape = input.get_partial_shape();
-        if (pshape.size() != 4u) {
-            return false;
-        }
-        return pshape[1].is_static() && pshape[1].get_length() == 1 && pshape[3].is_static() &&
-               pshape[3].get_length() > 1024;
-    };
-
     std::map<std::string, ov::PartialShape> new_shapes;
     for (const auto& input : model->inputs()) {
         const auto& input_name = input.get_any_name();
